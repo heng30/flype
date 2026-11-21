@@ -1,0 +1,549 @@
+/*
+ * Flype Rust 核心的 C ABI。
+ *
+ * 生命周期：
+ * - flype_engine_new 成功返回句柄，必须用 flype_engine_free 释放；
+ * - flype_engine_input 返回的候选句柄必须用 flype_candidates_free 释放；
+ * - 返回的字符串指针在对应句柄释放前有效（错误串在下一次 API 调用前有效）。
+ */
+#ifndef FLYPE_CORE_H
+#define FLYPE_CORE_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+/* 接口版本（不是 Flype 的版本）。同一个主版本里只加函数、只在结构体末尾加字段；
+ * 删函数或改参数含义时升主版本。外壳启动时用 flype_abi_version() 比对主版本。
+ * 规则见 docs/ABI.md。 */
+#define FLYPE_ABI_VERSION_MAJOR 3
+#define FLYPE_ABI_VERSION_MINOR 0
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* 编进库里的接口版本：主版本 * 1000 + 次版本。 */
+int flype_abi_version(void);
+
+/* 引擎句柄（不透明）；一个进程里可以有好几个，各带自己的词库和状态。 */
+typedef struct FlypeEngineHandle FlypeEngineHandle;
+/* 候选集合句柄（不透明），读完要 flype_candidates_free。 */
+typedef struct FlypeCandidates FlypeCandidates;
+
+/* 创建引擎；bigram_tsv_path 可为 NULL 或空串。失败返回 NULL。 */
+FlypeEngineHandle *flype_engine_new(const char *lexicon_tsv_path,
+                                        const char *bigram_tsv_path);
+
+/* 释放引擎。 */
+void flype_engine_free(FlypeEngineHandle *engine);
+
+/* 设置 beam size；成功返回 0，失败返回 -1。 */
+int flype_engine_set_beam_size(FlypeEngineHandle *engine, unsigned int beam_size);
+
+/* 每次输入最多返回多少个整句候选（句首词候选另算）。返回 0 成功。 */
+int flype_engine_set_max_candidates(FlypeEngineHandle *engine, unsigned int max_candidates);
+
+/* 开关按错键纠错（相邻键、两键按反、多按/漏按），默认开。返回 0 成功。 */
+int flype_engine_set_typo_correction(FlypeEngineHandle *engine, int on);
+
+/* 是否也出 CJK 扩展 B 区及以后的单字（ABI 1.9 起），默认不出：常见中文字体都没有这些字，
+ * 列出来是方块。通用规范汉字表里的扩展区字和含这些字的词不受影响。返回 0 成功。 */
+int flype_engine_set_rare_ext_chars(FlypeEngineHandle *engine, int on);
+
+/* 载入英文词表（每行一个词，或 rime 的 en.dict.yaml）。
+ * 载入后输入已知英文词（hello、github）时英文排在前面。返回累计词条数，失败返回 -1。 */
+int flype_engine_load_english(FlypeEngineHandle *engine, const char *path);
+
+/* 载入字级神经语言模型（微信输入法的 nlrgpt2_nnlm.bin，或 Flype 自己的），
+ * 用来给整句候选重排。返回字表大小，失败返回 -1。 */
+int flype_engine_load_nnlm(FlypeEngineHandle *engine, const char *path);
+
+/* 只检查 path 是不是读得出来的字级神经语言模型（不载入任何引擎）：返回字表大小，读不出来返回 -1
+ * （原因见 flype_last_error）。设置界面导入微信输入法的模型前用它试解析，不看版本号。（1.11） */
+int flype_nnlm_check(const char *path);
+
+/* 混上用户自己训的领域词级模型（flype-lmbuild 生成，和 words.lm 同格式），path 为 NULL/空串时去掉；
+ * 再调一次是换掉上一个，不会叠着混。返回 0 成功，-1 失败（原来的不动）。（1.10） */
+int flype_engine_set_domain_lm(FlypeEngineHandle *engine, const char *path);
+
+/* 开关模糊音（z/zh、c/ch、s/sh、an/ang、en/eng、in/ing）。返回 0 成功。 */
+int flype_engine_set_fuzzy(FlypeEngineHandle *engine, int on);
+/* 打开的模糊音分组（位掩码）：1 z/zh，2 c/ch，4 s/sh，8 n/l，16 f/h，32 r/l，
+ * 64 an/ang，128 en/eng，256 in/ing，512 ian/iang，1024 uan/uang，2048 un/ong。
+ * 默认 1|2|4|64|128|256|512|1024。 */
+int flype_engine_set_fuzzy_groups(FlypeEngineHandle *engine, unsigned int groups);
+
+/* ASCII 标点转中文标点；未收录返回 NULL。指针在下一次调用前有效。 */
+const char *flype_fullwidth_punct(int ascii_codepoint);
+
+/* 按标点样式转换：style 0 全角、1 半角；prev 是光标前一个字符（不知道传 0）。
+ * 返回 NULL 表示原样上屏这个 ASCII 字符（半角样式、数字后面的符号）。 */
+const char *flype_punct(int ascii_codepoint, int style, int prev_codepoint);
+
+/* 中英文之间自动补空格（ABI 1.2 起）：prev 是光标前一个字，next 是要上屏的第一个字；
+ * flags 1 = 汉字和字母之间、2 = 汉字和数字之间。要在两者之间补一个空格返回 1，否则 0。
+ * 只看这一处边界，词里原有的字母（T恤、卡拉OK）不拆。 */
+int flype_autospace(int prev_codepoint, int next_codepoint, int flags);
+
+/* 全部内置符号（ABI 1.2 起），结果用 flype_candidates_* 读取并释放。 */
+FlypeCandidates *flype_symbol_list(void);
+
+/* 剪贴板历史（ABI 1.2 起）：只在内存里，最多 20 条，最新的在前，重复的挪到最前。
+ * remember 记下一条（空白、超过 16 KB 的不记），记下返回 1；history 用 flype_candidates_*
+ * 读取并释放。输入法自己拿不到系统剪贴板，由外壳把看到的文字交进来。 */
+int flype_clipboard_remember(const char *text);
+/* 现在的剪贴板历史（最新的在前）；用 flype_candidates_* 读取并释放。 */
+FlypeCandidates *flype_clipboard_history(void);
+/* 清空剪贴板历史（关掉 ClipboardHistory 时外壳调一次）。 */
+void flype_clipboard_clear(void);
+
+/* 自定义词（常用语）按 custom.tsv 的顺序（ABI 1.2 起）：text 是词（转义原样显示），
+ * pinyin 是编码，flype_candidates_commit 是上屏的文字（\n 换成了换行）。 */
+FlypeCandidates *flype_engine_custom_phrases(const FlypeEngineHandle *engine);
+
+/* 符号检索（拼音/中文名前缀），结果用 flype_candidates_* 读取并释放。 */
+FlypeCandidates *flype_symbol_search(const char *query, size_t limit);
+
+/* 打字时的 emoji 推荐。text 是首选候选的文字；结果的 text 是显示文字，
+ * 上屏用 flype_candidates_commit（整个词对上时只有 emoji，句尾对上时是整句 + emoji）。 */
+FlypeCandidates *flype_emoji_recommend(const char *text, size_t limit);
+
+/* 候选正好是数字字（零到十）时对应的按键 emoji（「八」-> 8️⃣），别的返回 NULL。
+ * 返回静态字符串，不用释放。 */
+const char *flype_emoji_keycap(const char *text);
+
+/* 日期、时间候选：key 是 riqi / shijian / xingqi / date / time（可带隔音符）；时间按本地时区，
+ * weekday 0 = 星期日。不是触发词时返回空列表。 */
+FlypeCandidates *flype_datetime_candidates(const char *key, int year, int month, int day,
+                                               int hour, int minute, int second, int weekday);
+
+/* V 模式计算器：expr 是 v 后面的算式（1+2*3）。算得出来时给「结果」「算式=结果」，
+ * 没写完时只给算式本身。 */
+FlypeCandidates *flype_calc_candidates(const char *expr);
+
+/* 表情面板搜索。query 为空给全部 emoji；否则按拼音（经引擎转成中文词）、英文、
+ * 符号名一起找。engine 可为 NULL。 */
+FlypeCandidates *flype_engine_emoji_search(const FlypeEngineHandle *engine,
+                                               const char *query, size_t limit);
+
+/* 记录一次选词，参与历史排序特征。返回 0 成功，-1 失败。 */
+int flype_engine_record_selection(FlypeEngineHandle *engine, const char *word);
+
+/* 记录选词并带上拼音：选够次数后自动加入用户词库。pinyin 可为 NULL。 */
+int flype_engine_record_selection_ex(FlypeEngineHandle *engine,
+                                       const char *word, const char *pinyin);
+
+/* 设置光标前文本，参与上下文 bigram 特征。返回 0 成功，-1 失败。 */
+int flype_engine_set_context(FlypeEngineHandle *engine, const char *text);
+
+/* 用户词库 */
+/* 加一条用户词，pinyin 可以是 ni hao / nihao / xi'an；返回 0 成功，-1 参数不对（原因见
+ * flype_last_error）。只在内存里，要存盘还得 flype_engine_save_user_dict。 */
+int flype_engine_add_user_word(FlypeEngineHandle *engine, const char *pinyin,
+                                 const char *word);
+/* 从用户词库删掉这个词：删掉了返回 1，本来没有返回 0，-1 参数不对。 */
+int flype_engine_remove_user_word(FlypeEngineHandle *engine, const char *word);
+/* 存用户词库，返回 0 成功，-1 失败。1.7 起空的也写（只有注释行），以前空的时候返回 -1。 */
+int flype_engine_save_user_dict(FlypeEngineHandle *engine, const char *path);
+/* 读用户词库（拼音<TAB>词<TAB>热度），整体替换现在这份。返回收下的条数，-1 表示读不出来。 */
+int flype_engine_load_user_dict(FlypeEngineHandle *engine, const char *path);
+/* 自定义词（设置里添加的，custom.tsv：拼音<TAB>词[<TAB>频次]）：整体替换上一次读到的，
+ * 文件不存在就清空；不写回用户词库。返回收下的条数，-1 表示出错。 */
+int flype_engine_load_custom_words(FlypeEngineHandle *engine, const char *path);
+
+/* 用户输入习惯：选过的词的热度（30 天半衰期）和词搭配（上一个词 -> 这个词），
+ * 参与排序，存成 TSV。save 返回 0 成功；load 返回条数，-1 表示出错。 */
+int flype_engine_save_history(FlypeEngineHandle *engine, const char *path);
+int flype_engine_load_history(FlypeEngineHandle *engine, const char *path);
+
+/* 后台存盘（1.11）：上面两个 save 在调用的线程上写完才返回（先写临时文件、刷到盘上再改名，要等两次 fsync），
+ * 别在按键的线程上用。_async 只在锁里抄一份要写的数据就返回，引擎自己的一个线程去写（写法和同步的一样）；
+ * 同一个文件还没开始写时，后来的那份顶掉前面的（连着的几次合并成一次）。返回 0 交出去了，-1 参数不对。
+ * 同步的 save 会先等后台排着的写完，不会被后写的旧数据盖掉。 */
+int flype_engine_save_user_dict_async(FlypeEngineHandle *engine, const char *path);
+int flype_engine_save_history_async(FlypeEngineHandle *engine, const char *path);
+/* 等后台存盘写完（1.11）：timeout_ms 小于 0 一直等，否则最多等这么久（0 只看一眼）。返回 0 都写完了、
+ * 上次调用以后交的都写成了；1 还没写完；-1 上次调用以后有写失败的（原因在 flype_last_error，只报一次）。
+ * 进程退出、外壳析构、换词库（新引擎要读这些文件）前调一次 -1；flype_engine_free 也会先写完再释放。 */
+int flype_engine_save_wait(FlypeEngineHandle *engine, int timeout_ms);
+
+/* 输入拼音串；失败返回 NULL。 */
+FlypeCandidates *flype_engine_input(FlypeEngineHandle *engine, const char *input);
+
+/**
+ * 基于上一词的预测（预测词库）。
+ * 成功返回候选集合（text 为预测词，score 为对数概率），必须 flype_candidates_free；
+ * 失败返回 NULL，用 flype_last_error 取原因。
+ */
+FlypeCandidates *flype_engine_predict_next(const FlypeEngineHandle *engine,
+                                               const char *prev_word,
+                                               size_t limit);
+
+/* 候选数量。 */
+size_t flype_candidates_len(const FlypeCandidates *candidates);
+
+/* 候选文本（UTF-8，NUL 结尾）；索引越界返回 NULL。 */
+const char *flype_candidates_text(const FlypeCandidates *candidates, size_t index);
+
+/* 候选分数；索引越界返回 0。 */
+double flype_candidates_score(const FlypeCandidates *candidates, size_t index);
+
+/* 候选拼音（空格分隔音节，纠错后的写法），可传给 record_selection_ex；
+ * 预测/符号结果为空串，越界返回 NULL。 */
+const char *flype_candidates_pinyin(const FlypeCandidates *candidates, size_t index);
+
+/* 候选用掉了输入的多少字节。等于输入长度是整句候选；小于时是句首词候选，
+ * 上屏后应把 input + consumed 之后的部分留在编辑区继续输入。越界返回 0。 */
+size_t flype_candidates_consumed(const FlypeCandidates *candidates, size_t index);
+
+/* 选中后上屏的文字（emoji 推荐可能和显示的不同），其他候选等于 text。越界返回 NULL。 */
+const char *flype_candidates_commit(const FlypeCandidates *candidates, size_t index);
+
+/* 释放候选集合。 */
+void flype_candidates_free(FlypeCandidates *candidates);
+
+/* 编辑区显示用：按候选拼音（空格分隔，flype_candidates_pinyin）给输入分词，
+ * hengxiang + "heng xiang" -> heng'xiang。保留用户打的字母（大小写、按错的键）。
+ * 切不了（英文、差得太多）返回 NULL；返回的串在同一线程下一次调用前有效。 */
+const char *flype_segment_input(const char *input, const char *pinyin);
+
+/* 自定义词的编码整理（设置界面加词、导入用，规则在核心里一份）：pinyin_only 非 0 时只认拼音，
+ * Ni Hǎo、nihao、ni'hao、ni3hao3 -> "ni hao"，ü、u:、u 加分音符写成 v，单独的 r 是儿化；
+ * 否则不是拼音但全是字母的（mail）也行，去掉隔音符、小写。不合法返回 NULL；
+ * 返回的串在同一线程下一次调用本函数或 flype_guess_pinyin 前有效。（1.10） */
+const char *flype_custom_code(const char *text, int pinyin_only);
+
+/* 在词库原文（lexicon 起 len 个字节，拼音<TAB>词<TAB>频次，一行一条）里猜 word 的拼音，
+ * 设置界面加词时自动填编码：整个词有就取频次最高的那条，没有就一个字一个字找，结果整理成
+ * 空格分开的音节。猜不出（有词库里没有的字、英文）返回 NULL；返回的串在同一线程下一次调用
+ * 本函数或 flype_custom_code 前有效。（1.10） */
+const char *flype_guess_pinyin(const char *lexicon, size_t len, const char *word);
+
+/* 最近一次错误信息，可能为空串。 */
+const char *flype_last_error(void);
+
+/* 版本号，例如 0.1.0。 */
+const char *flype_version(void);
+
+/*
+ * 语音输入（核心带 voice 特性编译时才有，默认带）。
+ *
+ * 识别用微信输入法的离线模型：不随软件分发，由用户在设置界面（flype-config）里下载到
+ * model_dir；这里只读不下载，第一次按热键时读进内存，之后常驻。没有模型时按热键，
+ * poll 返回 FLYPE_VOICE_ERROR（文本是去设置里下载的提示），model_state 返回
+ * FLYPE_VOICE_MODEL_MISSING。所有函数都不阻塞：开麦克风、读模型、解码都在后台线程。
+ *
+ * 用法：热键按下/松开调 key_down/key_up；录音期间每几十毫秒调一次 poll，
+ * 按返回的状态显示提示或上屏 flype_voice_text。
+ * 按住超过 300ms 松开即结束；更短算点按，继续听到静音 1.5 秒或再按一次热键。
+ * 设了环境变量 FLYPE_VOICE_WAV 时不开麦克风，改读这个 WAV 文件（测试用）。
+ */
+typedef struct FlypeVoice FlypeVoice;
+
+enum {
+    FLYPE_VOICE_IDLE = 0,
+    FLYPE_VOICE_LISTENING = 1,   /* 正在听；文本是中间结果（可能为空） */
+    FLYPE_VOICE_RECOGNIZING = 2, /* 录完了，正在出最终结果 */
+    FLYPE_VOICE_RESULT = 3,      /* 最终结果，文本即要上屏的字；只返回一次 */
+    FLYPE_VOICE_ERROR = 4,       /* 出错或没听清，文本是原因；只返回一次 */
+};
+
+enum {
+    FLYPE_VOICE_MODEL_NONE = 0,
+    FLYPE_VOICE_MODEL_DOWNLOADING = 1, /* 不再返回：模型改在设置界面里下载 */
+    FLYPE_VOICE_MODEL_LOADING = 2,
+    FLYPE_VOICE_MODEL_READY = 3,
+    FLYPE_VOICE_MODEL_FAILED = 4,
+    FLYPE_VOICE_MODEL_MISSING = 5, /* 按了热键，但模型还没下载 */
+};
+
+/* model_dir 为 NULL/空串时用 ~/.local/share/flype/wtlocal。
+ * 核心不带 voice 特性编译时返回 NULL（其余函数接受 NULL，什么也不做）。 */
+FlypeVoice *flype_voice_new(const char *model_dir);
+/* 释放句柄；正在说话的话先取消录制。 */
+void flype_voice_free(FlypeVoice *voice);
+/* 语音热键按下（开始听）。 */
+void flype_voice_key_down(FlypeVoice *voice);
+/* 语音热键松开（按住够久的直接结束录，更短的算点按、继续听）。 */
+void flype_voice_key_up(FlypeVoice *voice);
+/* 丢掉这次说的话（Esc、切走输入框）。 */
+void flype_voice_cancel(FlypeVoice *voice);
+/* 返回 FLYPE_VOICE_*。 */
+int flype_voice_poll(FlypeVoice *voice);
+/* 上一次 poll 对应的文本；下一次 poll 或释放前有效。 */
+const char *flype_voice_text(const FlypeVoice *voice);
+/* 正在听时最近的音量，0–100（画波形用）。 */
+int flype_voice_level(const FlypeVoice *voice);
+/* 返回 FLYPE_VOICE_MODEL_*。 */
+int flype_voice_model_state(const FlypeVoice *voice);
+/* 松开热键后还在听（点按模式）时返回 1。 */
+int flype_voice_is_tap(const FlypeVoice *voice);
+
+/* ---- 输入会话（ABI 1.3 起，1.4 加候选和分音节，1.5 加选词和学习，1.6 加选词键、翻页和展开面板，
+ * 1.7 加 Ctrl+Delete 忘掉学错的词；
+ * 见 docs/PORTING.md、docs/ABI.md）----
+ *
+ * 一个输入框一个会话：外壳把平台按键翻成 FlypeKey 交给会话，按返回的 FlypeFrame
+ * 画编辑区、上屏。会话只能在一个线程里用。
+ *
+ * 暂定：输入行为还在一块一块从 fcitx5 外壳挪进来（docs/PORTING.md 第 2 步），挪完之前
+ * 这组函数不在「只加不删」的承诺里。标了「过渡」的函数挪完就删；现在 handled = 0 的意思是
+ * 「会话还不管这个键」，外壳接着用自己的逻辑处理（挪完以后就是「交给应用」）。
+ *
+ * 已经由会话处理的键：字母、隔音符（编辑区不空时）、退格（先撤销最后一次选词，没有选词
+ * 才删字母）、Esc（清空）。候选列表（引擎候选 + 计算器、emoji 推荐、数字按键 emoji、日期时间）
+ * 和编辑区分音节也由会话算（1.4 起），选词、上屏和学习也在会话里（1.5 起）；空格、回车、数字、
+ * 分号引号选词、V 模式算式、翻页、移动候选、展开面板也由会话处理（1.6 起）。
+ * 打字途中的 Ctrl+Delete、Ctrl+退格、Shift+Delete 忘掉光标处学过的词（1.7 起，frame->forgot）：
+ * 带 Ctrl 的这几个键也要交给会话。
+ * 还在外壳里的：打字途中的标点（先上屏再出标点）、工具栏、表情面板。 */
+
+/* 输入会话句柄（不透明）：一个输入框一个，只能在一个线程里用，引擎要比它活得久。 */
+typedef struct FlypeSession FlypeSession;
+
+/* 修饰键位掩码（和 fcitx5 的 KeyState 取值一样）。 */
+#define FLYPE_MOD_SHIFT (1u << 0)
+#define FLYPE_MOD_CAPS (1u << 1)
+#define FLYPE_MOD_CTRL (1u << 2)
+#define FLYPE_MOD_ALT (1u << 3)
+#define FLYPE_MOD_NUMLOCK (1u << 4) /* 1.6 起：和 CapsLock 一样不影响数字选词 */
+#define FLYPE_MOD_SUPER (1u << 6)
+
+/* 平台自己的翻页、移动候选热键（fcitx5 全局设置里的 [Hotkey/PrevPage] 等）或候选框上的
+ * 翻页按钮：外壳翻成动作放进 FlypeKey.action（1.6 起）。方向键带了动作也照横排竖排的规则走。
+ * keysym 可以是 0（只有动作）。没在打字时动作交给应用。 */
+#define FLYPE_KEY_ACTION_NONE 0
+#define FLYPE_KEY_ACTION_PREV_PAGE 1
+#define FLYPE_KEY_ACTION_NEXT_PAGE 2
+#define FLYPE_KEY_ACTION_PREV_CANDIDATE 3
+#define FLYPE_KEY_ACTION_NEXT_CANDIDATE 4
+/* 1.10 起：外壳只是告诉会话有这个键（松开的、外壳自己处理掉的），会话不处理它，只用来判断
+ * 单按 Shift（按住 Shift 时按了别的键就不算）。外壳每个非 Shift 的键都先这样报一下。 */
+#define FLYPE_KEY_ACTION_OBSERVE 5
+/* 1.10 起：设置里另设的切换键（ToggleKey），外壳认出来后带上这个动作交给会话：中 ↔ 英，
+ * frame->mode_changed 为 1。开着工具栏、表情面板时别带（按键归面板）。 */
+#define FLYPE_KEY_ACTION_TOGGLE_MODE 6
+
+/* 一次按键。keysym 是 XKB keysym 的子集（字母、数字、标点、方向、功能键）。
+ * size 填 sizeof(FlypeKey)：以后在末尾加字段，旧外壳没填的字段当 0。 */
+typedef struct {
+    uint32_t size;
+    uint32_t keysym;
+    uint32_t modifiers; /* FLYPE_MOD_* */
+    uint32_t release;   /* 0 按下，1 松开 */
+    uint32_t prev_char; /* 应用里光标前一个字符（Unicode 码位），读不到给 0。1.10 起会话按它决定
+                         * 数字后面的标点保持英文（读不到时看会话自己记的上一个字）、要不要自动补空格
+                         * （读不到就不补），带 FLYPE_KEY_HINT_SURROUNDING 时还拿它核对会话记的上文 */
+    uint32_t action;    /* FLYPE_KEY_ACTION_*（1.6 起） */
+    uint32_t hints;     /* 1.10 起：FLYPE_KEY_HINT_*，输入框的情况 */
+    uint32_t code;      /* 1.10 起：按键码（硬件键码），不知道给 0。单按 Shift 时按下、松开按它对上 */
+    uint32_t repeat;    /* 1.10 起：按住不放的自动重复 */
+    uint64_t time_ms;   /* 1.10 起：按键时刻（毫秒，单调递增的任意起点），不知道给 0 */
+} FlypeKey;
+
+/* FlypeKey.hints（1.10 起）。 */
+#define FLYPE_KEY_HINT_NO_AUTO_SPACE (1u << 0) /* 密码框、网址框、邮箱框：不自动补空格 */
+#define FLYPE_KEY_HINT_PANEL_OPEN (1u << 1)    /* 外壳开着自己的面板（表情面板、工具栏）：按 Shift 不切中英文 */
+#define FLYPE_KEY_HINT_SURROUNDING (1u << 3)   /* 应用告诉了光标周围的文字：prev_char 为 0 是光标前确实没有字 */
+#define FLYPE_KEY_HINT_NO_LEARN (1u << 4)      /* 确定是密码框：选的词也不学（回车上屏的原始字母串本来就不学）（1.11） */
+
+/* 输入模式（1.10 起）。单按 Shift（Shift_L 0xffe1 / Shift_R 0xffe2 的按下、松开都交给会话）
+ * 在中 ↔ 英之间切换，frame->mode_changed 为 1。
+ * 英文模式下会话只管字母、数字前的自动空格，别的键都交给应用。 */
+#define FLYPE_MODE_CHINESE 0
+#define FLYPE_MODE_ENGLISH 1
+
+/* 用哪边的 Shift 单按切换（FlypeSessionConfig.shift_toggle，1.10 起）。 */
+#define FLYPE_SHIFT_TOGGLE_BOTH 0
+#define FLYPE_SHIFT_TOGGLE_LEFT 1
+#define FLYPE_SHIFT_TOGGLE_RIGHT 2
+#define FLYPE_SHIFT_TOGGLE_OFF 3
+
+/* 设置里能选的翻页键（FlypeSessionConfig.page_keys 的位掩码）。PgUp PgDn 一直能用；
+ * 方向键挑候选（FLYPE_ARROW_KEYS_CANDIDATES）时，横排上下键、竖排左右键也翻页。 */
+#define FLYPE_PAGE_KEYS_MINUS (1u << 0)   /* - = */
+#define FLYPE_PAGE_KEYS_BRACKET (1u << 1) /* [ ] */
+#define FLYPE_PAGE_KEYS_COMMA (1u << 2)   /* , . */
+#define FLYPE_PAGE_KEYS_TAB (1u << 3)     /* Shift+Tab Tab */
+
+/* 分号、引号选词（FlypeSessionConfig.select_keys）。 */
+#define FLYPE_SELECT_KEYS_OFF 0
+#define FLYPE_SELECT_KEYS_SEMICOLON 1       /* 分号选第 2 个 */
+#define FLYPE_SELECT_KEYS_SEMICOLON_QUOTE 2 /* 再加引号选第 3 个 */
+
+/* 打字途中方向键做什么（FlypeSessionConfig.arrow_keys，1.10 起，#129）。 */
+#define FLYPE_ARROW_KEYS_CANDIDATES 0 /* 挑候选，跟着 horizontal：横排左右选词、上翻页、下展开面板；
+                                         * 竖排上下选词、左右翻页 */
+#define FLYPE_ARROW_KEYS_CARET 1      /* 上下键选词；左右键在拼音里移动光标（字母插在光标处、退格删
+                                         * 光标前一个，Home、End、Delete 也管光标），方向键不翻页 */
+
+/* 会话的设置。size 填 sizeof(FlypeSessionConfig)；外壳没填的字段（size 短）用默认值。
+ * 传 NULL 全用默认。 */
+typedef struct {
+    uint32_t size;
+    uint32_t page_size; /* 一页几个候选，0 用默认（9）；数字按键 emoji 只在第一页里找 */
+    int calculator;     /* V 模式计算器，默认 1 */
+    int date_time;      /* 日期时间候选，默认 1 */
+    int emoji_suggest;  /* 打字推荐 emoji，默认 1 */
+    int horizontal;     /* 1.6 起：候选横排，默认 1；0 竖排。方向键怎么用见 FLYPE_ARROW_KEYS_* */
+    uint32_t page_keys; /* 1.6 起：FLYPE_PAGE_KEYS_*，默认 FLYPE_PAGE_KEYS_MINUS */
+    int select_keys;    /* 1.6 起：FLYPE_SELECT_KEYS_*，默认 OFF */
+    int pick_char;      /* 1.8 起：以词定字，打拼音途中 [ 上屏光标处候选的第一个字、] 最后一个字，
+                         * 默认 1；page_keys 带 [ ] 时让给翻页 */
+    int punct_style;    /* 1.10 起：0 全角（中文标点，默认）、1 半角（标点原样交给应用） */
+    uint32_t auto_space; /* 1.10 起：中英文之间自动补空格，1 汉字和字母之间、2 汉字和数字之间，
+                          * 可以相加；0 关（默认） */
+    int shift_toggle;    /* 1.10 起：FLYPE_SHIFT_TOGGLE_*，默认两边都行 */
+    uint32_t shift_tap_ms; /* 1.10 起：按住 Shift 多久以内松开算单按（毫秒），0 用默认 500 */
+    int toolbar;         /* 1.10 起：只打一个 v 再按空格打开工具栏，默认 1 */
+    int clipboard_history; /* 1.10 起：记剪贴板历史（工具栏「剪贴板」页的提示看它），默认 0 */
+    int arrow_keys;      /* 1.10 起：FLYPE_ARROW_KEYS_*，默认 CANDIDATES */
+    int association;     /* 1.11 起：上屏以后的联想（选词、整句上屏以后给出一页常跟在后面的词，
+                          * frame->panel 是 FLYPE_PANEL_ASSOCIATION），默认 0：外壳要会画联想才开，
+                          * 设置里 Association 的默认值是开。密码框（KEY_HINT_NO_LEARN）不出 */
+} FlypeSessionConfig;
+
+/* 一次调用之后外壳要做的事。归会话所有，和里面的字符串一起在同一个会话的下一次调用前有效。
+ * 读 size 之外的字段前先看 size（旧核心给的结构体短）。 */
+typedef struct {
+    uint32_t size;
+    int handled;           /* 会话处理了这个键；0 见上面「暂定」 */
+    const char *commit;    /* 要上屏的字，没有为 NULL */
+    const char *preedit;   /* 编辑区文字（不为 NULL）：已选的词 + 还没选的输入（分好音节，
+                            * nihao 显示成 ni'hao；没有引擎时是原始输入） */
+    int preedit_cursor;    /* 编辑区光标，UTF-8 字节偏移 */
+    const char *aux;       /* 候选框上方的提示（1.10 起：工具栏、表情面板、联想），
+                            * 没有为 NULL。可以没有候选只有提示 */
+    int panel;             /* FLYPE_PANEL_*：0 普通一页、1 展开面板（横排按下键，6 列，一屏 6 行）、
+                            * 2 表情面板（1.10 起，同样的网格，preedit 是搜索词）、
+                            * 3 工具栏（1.10 起，竖排一列，一页 9 个）；面板的提示在 aux；
+                            * 4 联想（1.11 起，没在打字，preedit 是空的；照普通候选框画，提示在 aux，
+                            * 按 Tab 进了联想行时 cand_cursor 是光标，没进是 -1，这时别画序号：数字不选联想） */
+    size_t cand_count;     /* 候选框里显示几个（一页，或展开面板的一屏）；用 flype_session_candidate 取 */
+    int cand_cursor;       /* 光标在显示的这些里的位置；-1 不在这一页上（翻页按钮翻走以后） */
+    int has_prev, has_next; /* 前面 / 后面还有一页（展开面板是一屏） */
+    uint32_t wake_after_ms; /* >0：这么久后再调会话（还没用，恒为 0） */
+    int forgot;             /* 1.7 起：这次按键（Ctrl+Delete）让引擎忘掉了一个学过的词，
+                             * 外壳该马上存用户词库和输入习惯（和上屏后存的一样） */
+    int learned;            /* 1.10 起：这次上屏里有引擎学到的选词（选了引擎的候选、原样上屏输入），
+                             * 外壳攒够次数存一次用户词库；只上屏了标点、emoji、计算结果、日期时间是 0 */
+    int mode;               /* 1.10 起：这次调用以后的输入模式，FLYPE_MODE_* */
+    int mode_changed;       /* 1.10 起：这次调用切换了输入模式（单按 Shift、flype_session_set_mode） */
+} FlypeFrame;
+
+/* 建会话。engine 可以传 NULL（词库没载入好时也能打字，载入好了用 set_engine 补上）；
+ * 传了的话要比会话活得久。config 可以传 NULL。 */
+FlypeSession *flype_session_new(FlypeEngineHandle *engine, const FlypeSessionConfig *config);
+/* 释放会话（引擎是外面传进来的，不跟着释放）。 */
+void flype_session_free(FlypeSession *session);
+/* 换引擎，可以传 NULL。 */
+void flype_session_set_engine(FlypeSession *session, FlypeEngineHandle *engine);
+/* 改设置；config 为 NULL 全用默认。 */
+void flype_session_configure(FlypeSession *session, const FlypeSessionConfig *config);
+/* 现在的编辑区（不处理按键，handled 为 0）。session 为 NULL 时返回 NULL。 */
+const FlypeFrame *flype_session_frame(FlypeSession *session);
+/* 处理一次按键（按下和松开都给）。session 或 key 为 NULL 时返回 NULL。 */
+const FlypeFrame *flype_session_key(FlypeSession *session, const FlypeKey *key);
+/* 清空编辑区；commit_pending 非 0 时，已选的词 + 原始输入放进 frame->commit（切换输入法、
+ * 打字途中切英文时，和回车一样），原始字母串不记选词。commit_pending 为 0 是放弃（失去焦点、
+ * 应用重置了输入框）：打到一半的丢掉，会话记的上文也作废（1.10 起），开着的工具栏、表情面板也收起来。 */
+const FlypeFrame *flype_session_reset(FlypeSession *session, int commit_pending);
+/* 切换输入模式（1.10 起，FLYPE_MODE_*）：外部命令、设置里的默认模式、外壳全局的模式用。
+ * 切到英文时打到一半的（已选的词 + 原始输入）放进 frame->commit。 */
+const FlypeFrame *flype_session_set_mode(FlypeSession *session, int mode);
+/* 现在的输入模式（1.10 起），FLYPE_MODE_*；session 为 NULL 时是中文。 */
+int flype_session_mode(const FlypeSession *session);
+
+/* 外壳要上屏一段与拼音无关的字（工具栏、表情面板、语音识别结果）：补好空格放进 frame->commit。prev_char 是应用里光标前的字，读不到给 0。 */
+const FlypeFrame *flype_session_commit_text(FlypeSession *session, const char *text,
+                                                uint32_t prev_char);
+/* 工具栏和表情面板（1.10 起）。只打一个 v 再按空格会话自己打开工具栏；表情面板快捷键由外壳按设置认出来，
+ * 调 toggle。开着时按键都归面板（带 Ctrl / Alt / Super 的组合键收起面板、交给应用），条目用候选的
+ * 读法（flype_session_candidate、_candidate_info），选了的放进 frame->commit。
+ * 剪贴板历史由外壳读系统剪贴板交给 flype_clipboard_remember（打开工具栏之前读一次）。 */
+#define FLYPE_PANEL_NORMAL 0
+#define FLYPE_PANEL_EXPANDED 1
+#define FLYPE_PANEL_EMOJI 2
+#define FLYPE_PANEL_TOOL 3
+#define FLYPE_PANEL_ASSOCIATION 4 /* 1.11 起 */
+/* 工具栏的几页：菜单（进剪贴板、常用语、符号、表情）、剪贴板、常用语、符号、表情面板。 */
+#define FLYPE_TOOL_NONE 0
+#define FLYPE_TOOL_MENU 1
+#define FLYPE_TOOL_CLIPBOARD 2
+#define FLYPE_TOOL_PHRASES 3
+#define FLYPE_TOOL_SYMBOLS 4
+#define FLYPE_TOOL_EMOJI 5
+const FlypeFrame *flype_session_toggle_emoji_panel(FlypeSession *session);
+/* 打开工具栏的一页或表情面板（FLYPE_TOOL_*）；FLYPE_TOOL_NONE 关上。 */
+const FlypeFrame *flype_session_open_tool(FlypeSession *session, int tool);
+/* 开着的面板，FLYPE_TOOL_*。 */
+int flype_session_open_panel(const FlypeSession *session);
+/* 联想开着（frame->panel 是 FLYPE_PANEL_ASSOCIATION）返回 1，没有是 0。不改会话，之前拿到的 frame 照样有效：
+ * 外壳没在打字时据此画联想行（候选用 _candidate_total / _candidate_info 或 _candidate 取，鼠标点了用
+ * _choose / _select）。（1.11） */
+int flype_session_association(const FlypeSession *session);
+/* 最近用过的 emoji 存在这个文件（一行一个，进程内所有会话共用，最多 18 个）；NULL 或空串只记在内存里并清空。 */
+void flype_recent_emoji_path(const char *path);
+/* 最近用过的 emoji，最近的在前；用 flype_candidates_* 读取并释放。 */
+FlypeCandidates *flype_recent_emoji_list(void);
+/* 点候选（1.6 起）：index 是显示的这些（frame 的 cand_count 个）里的序号。和按数字键一样：
+ * 句首词进已选栈，用完输入就上屏并记选词。序号不对时 handled 为 0。 */
+const FlypeFrame *flype_session_select(FlypeSession *session, size_t index);
+/* 显示的第 index 个候选的字（1.6 起），index < cand_count，不然返回 NULL。
+ * 在同一会话下一次调用前有效。 */
+const char *flype_session_candidate(FlypeSession *session, size_t index);
+/* 显示的第 index 个候选后面的小字（1.10 起），没有为空串；
+ * 越界返回 NULL。和 FlypeCandidateInfo.comment 一样，画在字后面、不上屏。 */
+const char *flype_session_candidate_comment(FlypeSession *session, size_t index);
+
+/* 读会话的状态（外壳判断在不在打字、拼编辑区用）。返回的字符串在同一会话下一次调用前有效。 */
+const char *flype_session_input(FlypeSession *session);         /* 全部原始输入 */
+const char *flype_session_remaining(FlypeSession *session);     /* 还没选词的部分 */
+const char *flype_session_selected_text(FlypeSession *session); /* 已选的词连起来 */
+/* 选第 index 个候选（全部候选里的序号，不分页）：emoji、计算结果、日期时间原样上屏不学习；
+ * 句首词进已选栈、记一次选词；其余已选的词 + 它上屏，记选词（分几次选出来的整句也记一次）。
+ * 序号不对时 handled 为 0。fcitx5 的候选框点了整个列表里的第几个时用；工具栏、表情面板开着时选面板的。
+ * （1.10 删掉了 flype_session_append、_set_context：上文由会话自己记，面板的搜索词也在会话里。） */
+const FlypeFrame *flype_session_choose(FlypeSession *session, size_t index);
+
+/* 整个候选列表（不分页）：fcitx5 的候选框（CommonCandidateList）要整个列表，外壳抄过去画。
+ * 工具栏、表情面板开着时是面板的条目。 */
+#define FLYPE_CAND_WORD 0  /* 引擎的候选：选中要学习 */
+#define FLYPE_CAND_PLAIN 1 /* 计算结果、日期时间、带换行的自定义词：原样上屏，不学习 */
+#define FLYPE_CAND_EMOJI 2 /* emoji：上屏 commit，不学习 */
+typedef struct {
+    uint32_t size;      /* 填 sizeof(FlypeCandidateInfo) */
+    const char *text;   /* 候选框里显示的字 */
+    const char *pinyin; /* 空格分音节；计算结果、emoji 这类为空串 */
+    size_t consumed;    /* 用掉了还没选词那部分输入的多少字节；比它短是句首词 */
+    int kind;           /* FLYPE_CAND_* */
+    const char *commit; /* 选中时上屏的字（emoji 推荐在句尾对上时是「整句 + emoji」） */
+    const char *emoji;  /* emoji 本身；不是 emoji 为空串 */
+    const char *comment; /* 1.10 起：画在候选后面的小字，不上屏，
+                          * 没有为空串 */
+} FlypeCandidateInfo;
+/* 候选个数。没有引擎、没在打字时为 0。 */
+size_t flype_session_candidate_total(FlypeSession *session);
+/* 第 index 个候选写进 out（按 out->size 写）。返回 0 成功，-1 越界或参数为 NULL。
+ * 字符串在同一会话下一次改了编辑区、上文、引擎或设置的调用前有效。 */
+int flype_session_candidate_info(FlypeSession *session, size_t index, FlypeCandidateInfo *out);
+/* （1.10 删掉了 flype_session_last_choice：学没学到词看 frame->learned，选了 emoji 由会话记进最近用过。） */
+
+/* 候选框的页码、光标（1.6 起）：fcitx5 外壳的候选框（CommonCandidateList）要整个列表和页码、光标，
+ * 用它和 candidate_info 抄。 */
+typedef struct {
+    uint32_t size;        /* 填 sizeof(FlypeSessionView) */
+    size_t page;          /* 普通候选框在第几页 */
+    size_t cursor;        /* 普通候选框的光标（全部候选里的序号，可以不在这一页上） */
+    int expanded;         /* 展开面板开着 */
+    size_t grid_cursor;   /* 展开面板的光标（全部候选里的序号） */
+    uint64_t generation;  /* 候选重算过几次：变了就重新抄候选 */
+} FlypeSessionView;
+/* 返回 0 成功，-1 参数为 NULL。 */
+int flype_session_view(FlypeSession *session, FlypeSessionView *out);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* FLYPE_CORE_H */

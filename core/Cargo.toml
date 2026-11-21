@@ -1,0 +1,46 @@
+[package]
+name = "flype-core"
+version.workspace = true
+edition.workspace = true
+description = "WeType 风格拼音输入法引擎骨架（音节图 + 束搜索 + 排序）"
+
+[lib]
+name = "flype_core"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "flype-demo"
+path = "src/bin/demo.rs"
+
+[[bin]]
+name = "flype-bench"
+path = "src/bin/bench.rs"
+
+[[bin]]
+name = "flype-eval"
+path = "src/bin/eval.rs"
+
+[[bin]]
+name = "flype-check"
+path = "src/bin/check.rs"
+
+[[bin]]
+name = "flype-train"
+path = "src/bin/train.rs"
+
+[[bin]]
+name = "flype-show"
+path = "src/bin/show.rs"
+
+[[bin]]
+name = "flype-lmbuild"
+path = "src/bin/lmbuild.rs"
+
+[[bin]]
+name = "flype-probe"
+path = "src/bin/probe.rs"
+
+[dependencies]
+libc.workspace = true
+anyhow.workspace = true
+flype-voice.workspace = true

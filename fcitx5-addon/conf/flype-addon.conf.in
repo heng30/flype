@@ -1,0 +1,13 @@
+[Addon]
+Name=Flype Pinyin
+Name[zh_CN]=Flype 拼音引擎
+Category=InputMethod
+Version=@PROJECT_VERSION@
+Enabled=True
+Library=libflype
+Type=SharedLibrary
+OnDemand=True
+Configurable=True
+
+[Addon/Dependencies]
+0=core:@FLYPE_FCITX_CORE_DEP@

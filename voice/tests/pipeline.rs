@@ -1,0 +1,126 @@
+//! 语音链路的端到端测试：合成音频 → VAD → WAV → 外部识别器 → 上屏。
+//!
+//! 这些都不需要麦克风，所以能在 CI/开发机上跑通。真正的采集（cpal）
+//! 和全局热键只能在实机上验证。
+
+use std::sync::{Arc, Mutex};
+
+use flype_voice::asr::{AsrChannel, ProcessChannel};
+use flype_voice::sink::TextSink;
+use flype_voice::{read_wav, vad::Vad, write_wav, Typer};
+
+/// 一帧采样数（16kHz 下 10ms）
+const FRAME: usize = 160; // 16kHz 下 10ms
+
+/// 指定帧数（每帧 [`FRAME`] 个采样）的全 0 静音
+fn silence(frames: usize) -> Vec<i16> {
+    vec![0i16; FRAME * frames]
+}
+
+/// 指定帧数、固定幅度的方波，用来当作有能量的「语音」
+fn tone(frames: usize, amplitude: i16) -> Vec<i16> {
+    let mut out = Vec::with_capacity(FRAME * frames);
+    for i in 0..FRAME * frames {
+        // 简单的方波，保证能量稳定
+        let v = if (i / 8) % 2 == 0 {
+            amplitude
+        } else {
+            -amplitude
+        };
+        out.push(v);
+    }
+    out
+}
+
+/// 验证 VAD 只把有能量的声音判为语音，挂起结束后及时停止
+#[test]
+fn vad_separates_speech_from_silence() {
+    let mut vad = Vad::new(6.0, 15);
+    let mut speech = 0usize;
+    let mut quiet_speech = 0usize;
+
+    for chunk in silence(20).chunks(FRAME) {
+        if vad.push(chunk) {
+            quiet_speech += 1;
+        }
+    }
+    for chunk in tone(20, 8000).chunks(FRAME) {
+        if vad.push(chunk) {
+            speech += 1;
+        }
+    }
+    assert_eq!(quiet_speech, 0, "静音不应该被判为语音");
+    assert_eq!(speech, 20, "持续音应当全程判为语音，实际 {speech}");
+
+    // 挂起（hangover）结束后应当停止判语音
+    let mut tail = 0usize;
+    for chunk in silence(40).chunks(FRAME) {
+        if vad.push(chunk) {
+            tail += 1;
+        }
+    }
+    assert!(tail <= 15, "挂起帧数应不超过配置的 15，实际 {tail}");
+    assert!(!vad.is_speech(), "静音足够久后应停止录音");
+}
+
+/// 验证写出的 WAV 是 16kHz 单声道且采样值不变
+#[test]
+fn wav_roundtrip_preserves_samples() {
+    let path = std::env::temp_dir().join(format!("flype_rt_{}.wav", std::process::id()));
+    let samples = tone(10, 4000);
+    write_wav(&path, &samples).expect("写 WAV 失败");
+    let (rate, channels, back) = read_wav(&path).expect("读 WAV 失败");
+    assert_eq!(rate, 16_000);
+    assert_eq!(channels, 1);
+    assert_eq!(back, samples);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 验证外部识别脚本收到的是非空 WAV，且标准输出被当作识别文本
+#[test]
+fn process_channel_receives_valid_wav() {
+    // 用 {wav} 占位符让脚本自己检查文件是否存在且非空
+    let mut ch =
+        ProcessChannel::from_command_line("probe", r#"sh -c "test -s {wav} && echo 收到音频""#);
+    ch.feed(&tone(10, 4000));
+    assert_eq!(ch.finish().as_deref(), Some("收到音频"));
+}
+
+/// 捕获上屏内容的测试用后端
+#[derive(Default, Clone)]
+struct Capture {
+    text: Arc<Mutex<String>>,
+}
+
+impl TextSink for Capture {
+    /// 追加到已上屏内容
+    fn insert(&mut self, text: &str) {
+        self.text.lock().unwrap().push_str(text);
+    }
+    /// 往回删掉 count 个字，模拟退格
+    fn backspace(&mut self, count: usize) {
+        let mut guard = self.text.lock().unwrap();
+        for _ in 0..count {
+            guard.pop();
+        }
+    }
+}
+
+/// 验证边出字边修正时只补增量、中间结果被整体改掉时退格重打
+#[test]
+fn pipeline_types_partial_results() {
+    let mut typer = Typer::new();
+    let mut sink = Capture::default();
+
+    // 模拟「边说边出字」：中间结果不断修正
+    for partial in ["今天", "今天天", "今天天气"] {
+        let update = typer.update(partial);
+        sink.apply(update);
+    }
+    assert_eq!(sink.text.lock().unwrap().as_str(), "今天天气");
+
+    // 识别器最后把中间结果整个改掉，Typer 应当退格重打
+    let update = typer.update("明天");
+    sink.apply(update);
+    assert_eq!(sink.text.lock().unwrap().as_str(), "明天");
+}

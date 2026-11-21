@@ -1,0 +1,7 @@
+[InputMethod]
+Name=Flype
+Name[zh_CN]=Flype 拼音
+Icon=flype
+LangCode=zh_CN
+Addon=flype
+Configurable=True

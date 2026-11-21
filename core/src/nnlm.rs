@@ -1,0 +1,864 @@
+//! 字级神经语言模型：给整句候选重排。读两种文件，结构完全一样：
+//!
+//! - Flype 自己训的 `nnlm.bin`（WTNN 格式，随安装包分发，训练和导出见 `tools/nnlm/train.py`）；
+//! - 微信输入法自带的 `nlrgpt2_nnlm.bin`：腾讯的，**不随 Flype 分发**，用户在设置里从微信输入法的
+//!   安装包导入。文件格式和模型结构见 `docs/DATA.md` 的 NNLM 一节，简单说：
+//!
+//! - 文件 = 1 字节标志 + u32 长度 + TFLite 模型 + 字表哈希表 + 末尾一段 JSON；
+//! - 模型是 3 层 GPT-2（d=256，4 头，词表 5594 个字，最长 512 位置），权重全是 float32；
+//! - 字表的值里直接带了字的码位和编号，所以不用重算哈希就能还原出「字 -> 编号」。
+//!
+//! 推理是纯 Rust 的逐字前向（带 KV 缓存），一步约 4M 次乘加。同一个前缀算过就缓存起来，
+//! 用户接着打字时，前面的字不用再算。
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Mutex;
+
+use anyhow::{bail, Context, Result};
+
+/// 隐藏维度 d（两个模型都是 256）。
+const D: usize = 256;
+/// 注意力头数。
+const HEADS: usize = 4;
+/// 每个头的维度（D / HEADS）。
+const HEAD_DIM: usize = 64;
+/// 前馈层宽度（4d）。
+const FF: usize = 1024;
+/// 位置表长度，也就是能喂进去的最长序列。
+const MAX_POS: usize = 512;
+/// Transformer 层数。
+const LAYERS: usize = 3;
+
+/// 特殊编号（模型训练时的约定）。
+pub const UNK: u32 = 1;
+/// `<s>`，每个前缀的第一个编号。
+pub const BOS: u32 = 2;
+
+/// 上下文最多取光标前多少个字。
+const MAX_CONTEXT: usize = 24;
+/// 前缀缓存最多存多少个状态（每个约 7 KB）。
+const CACHE_CAP: usize = 6000;
+
+/// 一层 GPT-2 的权重：两个 LayerNorm、自注意力、前馈，形状见字段上的注释。
+struct Layer {
+    /// 注意力前那层 LayerNorm 的缩放 [D]。
+    ln1_g: Vec<f32>,
+    /// 注意力前那层 LayerNorm 的偏置 [D]。
+    ln1_b: Vec<f32>,
+    attn_w: Vec<f32>, // [3D, D]
+    /// qkv 投影的偏置 [3D]。
+    attn_b: Vec<f32>,
+    proj_w: Vec<f32>, // [D, D]
+    /// 注意力输出投影的偏置 [D]。
+    proj_b: Vec<f32>,
+    /// 前馈前那层 LayerNorm 的缩放 [D]。
+    ln2_g: Vec<f32>,
+    /// 前馈前那层 LayerNorm 的偏置 [D]。
+    ln2_b: Vec<f32>,
+    fc_w: Vec<f32>, // [FF, D]
+    /// 前馈第一层的偏置 [FF]。
+    fc_b: Vec<f32>,
+    out_w: Vec<f32>, // [D, FF]
+    /// 前馈输出层的偏置 [D]。
+    out_b: Vec<f32>,
+}
+
+/// 一个前缀算完后留下的东西：最后一个字在各层的 k、v，以及最后一层的输出和 log-sum-exp。
+/// 下一个字的 log 概率 = wte[字]·y - lse。
+struct State {
+    kv: Vec<f32>, // [LAYERS][2][D]
+    y: Vec<f32>,  // [D]
+    /// 整张词表上的 log-sum-exp，减掉它才得到 log 概率。
+    lse: f32,
+    /// 最后一次用到的时钟，缓存淘汰按它看谁最久没用。
+    used: u64,
+}
+
+/// 加载好的模型：字表、权重前缀缓存，`load` / `from_bytes` 之外只读。
+pub struct Nnlm {
+    /// 字 -> 编号，模型不认识的字不在这里。
+    vocab: HashMap<char, u32>,
+    wte: Vec<f32>, // [V, D]
+    wpe: Vec<f32>, // [MAX_POS, D]
+    /// 每层 Transformer 的权重，顺序和文件里一致。
+    layers: Vec<Layer>,
+    /// 最后一层 LayerNorm 的缩放 [D]。
+    lnf_g: Vec<f32>,
+    /// 最后一层 LayerNorm 的偏置 [D]。
+    lnf_b: Vec<f32>,
+    /// wte 的行数，也是 logit 的下标上界。
+    vocab_size: usize,
+    /// WTNN 文件头里的说明（第一行是 `flype-data:` 版本标记，后面是 JSON：名字、版本、语料、许可证）；
+    /// 微信的模型没有。
+    meta: Option<String>,
+    /// 前缀 -> 状态 的缓存，接着打字时只前向新增的那个字。
+    cache: Mutex<Cache>,
+}
+
+/// 前缀 -> 状态 的缓存，`clock` 每算一次加一，淘汰时按它看谁最久没用。
+#[derive(Default)]
+struct Cache {
+    /// 前缀（含 `<s>`）-> 算完留下的状态。
+    states: HashMap<Vec<u32>, State>,
+    /// 逻辑时钟，每用一次缓存加一。
+    clock: u64,
+}
+
+impl Nnlm {
+    /// 读文件建模型：报错时带上路径，方便在设置界面里说清是哪个文件坏了。
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        let data = std::fs::read(path).with_context(|| format!("读取 {}", path.display()))?;
+        Self::from_bytes(&data).with_context(|| format!("解析 {}", path.display()))
+    }
+
+    /// 从内存里的文件内容建模型：`WTNN` 开头走自己的格式，否则按微信的 nlrgpt2_nnlm.bin
+    /// 解（TFLite 权重 + 字表哈希表），权重名和形状对不上就报错。
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        if data.starts_with(WTNN_MAGIC) {
+            return Self::from_wtnn(data);
+        }
+        if data.len() < 16 || data[0] != 1 {
+            bail!("不是 nlrgpt2_nnlm.bin（文件头不对）");
+        }
+        let tfl_len = u32_at(data, 1)? as usize;
+        let tfl = data.get(5..5 + tfl_len).context("TFLite 段越界")?;
+        let mut tensors = read_tflite_tensors(tfl)?;
+        let vocab = read_vocab(data, 5 + tfl_len)?;
+
+        const P: &str = "tfgpt2lm_head_custom_model/transformer/";
+        // 词表大小从 wte 的长度推出来
+        let wte_key = tensors
+            .keys()
+            .find(|k| k.contains(&format!("{P}wte/Gather/resource")))
+            .cloned()
+            .context("找不到 wte")?;
+        let wte = tensors.remove(&wte_key).unwrap().1;
+        if wte.len() % D != 0 {
+            bail!("wte 长度 {} 不是 {D} 的倍数", wte.len());
+        }
+        let vocab_size = wte.len() / D;
+        if vocab_size < 1000 || vocab.values().any(|&id| id as usize >= vocab_size) {
+            bail!("字表和模型对不上（词表 {vocab_size}）");
+        }
+        let mut take = |pattern: &[&str], shape: &[usize]| -> Result<Vec<f32>> {
+            let hits: Vec<String> = tensors
+                .keys()
+                .filter(|k| pattern.iter().all(|p| k.contains(p)))
+                .cloned()
+                .collect();
+            if hits.len() != 1 {
+                bail!("找不到唯一的权重 {pattern:?}（命中 {}）", hits.len());
+            }
+            let (got_shape, values) = tensors.remove(&hits[0]).unwrap();
+            if values.len() != shape.iter().product::<usize>() {
+                bail!("权重 {pattern:?} 形状 {got_shape:?}，期望 {shape:?}");
+            }
+            Ok(values)
+        };
+        let wpe = take(&[&format!("{P}Gather/resource")], &[MAX_POS, D])?;
+        let mut layers = Vec::with_capacity(LAYERS);
+        for l in 0..LAYERS {
+            let h = format!("h_._{l}/");
+            let h = h.as_str();
+            layers.push(Layer {
+                ln1_g: take(&[h, "ln_1/batchnorm/mul/"], &[D])?,
+                ln1_b: take(&[h, "ln_1/batchnorm/ReadVariableOp/"], &[D])?,
+                attn_w: take(&[h, "attn/c_attn/MatMul"], &[3 * D, D])?,
+                attn_b: take(&[h, "attn/c_attn/add/"], &[3 * D])?,
+                proj_w: take(&[h, "attn/c_proj/MatMul"], &[D, D])?,
+                proj_b: take(&[h, "attn/c_proj/add/"], &[D])?,
+                ln2_g: take(&[h, "ln_2/batchnorm/mul/"], &[D])?,
+                ln2_b: take(&[h, "ln_2/batchnorm/ReadVariableOp/"], &[D])?,
+                fc_w: take(&[h, "mlp/c_fc/MatMul"], &[FF, D])?,
+                fc_b: take(&[h, "mlp/c_fc/add/"], &[FF])?,
+                out_w: take(&[h, "mlp/c_proj/MatMul"], &[D, FF])?,
+                out_b: take(&[h, "mlp/c_proj/add/"], &[D])?,
+            });
+        }
+        let lnf_g = take(&[&format!("{P}ln_f/batchnorm/mul/")], &[D])?;
+        let lnf_b = take(&[&format!("{P}ln_f/batchnorm/ReadVariableOp/")], &[D])?;
+        Ok(Self {
+            vocab,
+            wte,
+            wpe,
+            layers,
+            lnf_g,
+            lnf_b,
+            vocab_size,
+            meta: None,
+            cache: Mutex::new(Cache::default()),
+        })
+    }
+
+    /// Flype 自己的格式（`tools/nnlm/train.py` 导出）：
+    /// `WTNN`、u32 版本、u32 说明长度 + 说明（第一行是 `flype-data:` 版本标记，后面是 JSON）、
+    /// u32 词表大小 V、u32 字数 N、N 组 (u32 码位, u32 编号)、
+    /// float16 权重（wte、wpe、每层 12 个、ln_f 两个，顺序和形状同推理代码）。
+    fn from_wtnn(data: &[u8]) -> Result<Self> {
+        let version = u32_at(data, 4)?;
+        if version != 1 {
+            bail!("WTNN 版本 {version} 不认识");
+        }
+        let meta_len = u32_at(data, 8)? as usize;
+        let meta = data
+            .get(12..12 + meta_len)
+            .context("WTNN 说明越界")?;
+        let meta = std::str::from_utf8(meta).ok().map(str::to_owned);
+        let mut at = 12 + meta_len;
+        let vocab_size = u32_at(data, at)? as usize;
+        let n = u32_at(data, at + 4)? as usize;
+        if !(1000..65536).contains(&vocab_size) || n > vocab_size {
+            bail!("WTNN 词表大小不对（{vocab_size}，{n} 个字）");
+        }
+        at += 8;
+        let mut vocab = HashMap::with_capacity(n);
+        for _ in 0..n {
+            let cp = u32_at(data, at)?;
+            let id = u32_at(data, at + 4)?;
+            at += 8;
+            if id as usize >= vocab_size {
+                bail!("WTNN 字表编号越界");
+            }
+            if let Some(ch) = char::from_u32(cp) {
+                vocab.insert(ch, id);
+            }
+        }
+        let mut take = |len: usize| -> Result<Vec<f32>> {
+            let bytes = data.get(at..at + 2 * len).context("WTNN 权重不完整")?;
+            at += 2 * len;
+            Ok(bytes
+                .chunks_exact(2)
+                .map(|b| f16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+                .collect())
+        };
+        let wte = take(vocab_size * D)?;
+        let wpe = take(MAX_POS * D)?;
+        let mut layers = Vec::with_capacity(LAYERS);
+        for _ in 0..LAYERS {
+            layers.push(Layer {
+                ln1_g: take(D)?,
+                ln1_b: take(D)?,
+                attn_w: take(3 * D * D)?,
+                attn_b: take(3 * D)?,
+                proj_w: take(D * D)?,
+                proj_b: take(D)?,
+                ln2_g: take(D)?,
+                ln2_b: take(D)?,
+                fc_w: take(FF * D)?,
+                fc_b: take(FF)?,
+                out_w: take(D * FF)?,
+                out_b: take(D)?,
+            });
+        }
+        let lnf_g = take(D)?;
+        let lnf_b = take(D)?;
+        if [&wte, &wpe, &lnf_g].iter().any(|w| w.iter().any(|v| !v.is_finite())) {
+            bail!("WTNN 权重里有非有限数");
+        }
+        Ok(Self {
+            vocab,
+            wte,
+            wpe,
+            layers,
+            lnf_g,
+            lnf_b,
+            vocab_size,
+            meta,
+            cache: Mutex::new(Cache::default()),
+        })
+    }
+
+    /// 词表大小（wte 的行数，也是 logit 的下标上界）。
+    pub fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    /// 模型自带的说明（WTNN 的版本标记和 JSON）；微信的模型是 None。
+    pub fn meta(&self) -> Option<&str> {
+        self.meta.as_deref()
+    }
+
+    /// 字 -> 编号；不认识的字给 `<unk>`。
+    pub fn token(&self, ch: char) -> u32 {
+        self.vocab.get(&ch).copied().unwrap_or(UNK)
+    }
+
+    /// 字表里有这个字（没有就一律当 `UNK` 打分）。
+    pub fn knows(&self, ch: char) -> bool {
+        self.vocab.contains_key(&ch)
+    }
+
+    /// 光标前的文本转成编号前缀：`<s>` + 最后至多 24 个字。遇到换行就从换行后开始。
+    pub fn context_tokens(&self, context: &str) -> Vec<u32> {
+        let tail = context.rsplit('\n').next().unwrap_or("").trim_start();
+        let chars: Vec<char> = tail.chars().filter(|c| !c.is_whitespace()).collect();
+        let start = chars.len().saturating_sub(MAX_CONTEXT);
+        let mut out = Vec::with_capacity(chars.len() - start + 1);
+        out.push(BOS);
+        out.extend(chars[start..].iter().map(|&c| self.token(c)));
+        out
+    }
+
+    /// log P(text | prefix)，逐字相加（自然对数）。prefix 必须以 `<s>` 开头。
+    pub fn score(&self, prefix: &[u32], text: &str) -> f64 {
+        let tokens: Vec<u32> = text
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .map(|c| self.token(c))
+            .collect();
+        self.score_tokens(prefix, &tokens)
+    }
+
+    /// 逐字累加 log P：每算一步就借着缓存前向一步，前缀空或文本空给 0，超长截掉开头。
+    pub fn score_tokens(&self, prefix: &[u32], tokens: &[u32]) -> f64 {
+        if prefix.is_empty() || tokens.is_empty() {
+            return 0.0;
+        }
+        let mut seq: Vec<u32> = prefix.to_vec();
+        // 太长就截掉开头的上下文（保留 <s>）
+        let over = (seq.len() + tokens.len()).saturating_sub(MAX_POS);
+        if over > 0 {
+            let keep = seq.len().saturating_sub(over).max(1);
+            let cut = seq.len() - keep;
+            seq.drain(1..1 + cut.min(seq.len() - 1));
+            if seq.len() + tokens.len() > MAX_POS {
+                return 0.0;
+            }
+        }
+        let Ok(mut cache) = self.cache.lock() else {
+            return 0.0;
+        };
+        cache.clock += 1;
+        let mut total = 0.0f64;
+        for &tok in tokens {
+            self.ensure(&mut cache, &seq);
+            let state = cache.states.get(&seq).expect("刚算过");
+            total += (self.logit(tok, &state.y) - state.lse) as f64;
+            seq.push(tok);
+        }
+        if cache.states.len() > CACHE_CAP {
+            cache.evict();
+        }
+        total
+    }
+
+    /// 接在 prefix 后面、下一个字是 ch 的 log 概率（只算一步，同一个前缀算过就是查表）。
+    /// 联想用它按「接得上」排候选词：只看词的第一个字，几十个候选也只算一次前向。
+    pub fn next_char_logprob(&self, prefix: &[u32], ch: char) -> f32 {
+        if prefix.is_empty() || prefix.len() >= MAX_POS {
+            return 0.0;
+        }
+        let Ok(mut cache) = self.cache.lock() else {
+            return 0.0;
+        };
+        cache.clock += 1;
+        self.ensure(&mut cache, prefix);
+        let Some(state) = cache.states.get(prefix) else {
+            return 0.0;
+        };
+        let lp = self.logit(self.token(ch), &state.y) - state.lse;
+        if cache.states.len() > CACHE_CAP {
+            cache.evict();
+        }
+        lp
+    }
+
+    /// 下一个字的 log 概率分布里最大的几个（调试用）。
+    pub fn top_next(&self, prefix: &[u32], k: usize) -> Vec<(char, f32)> {
+        let Ok(mut cache) = self.cache.lock() else {
+            return Vec::new();
+        };
+        cache.clock += 1;
+        self.ensure(&mut cache, prefix);
+        let state = cache.states.get(prefix).expect("刚算过");
+        let inverse: HashMap<u32, char> = self.vocab.iter().map(|(&c, &i)| (i, c)).collect();
+        let mut all: Vec<(u32, f32)> = (0..self.vocab_size as u32)
+            .map(|t| (t, self.logit(t, &state.y) - state.lse))
+            .collect();
+        all.sort_by(|a, b| b.1.total_cmp(&a.1));
+        all.into_iter()
+            .filter_map(|(t, lp)| inverse.get(&t).map(|&c| (c, lp)))
+            .take(k)
+            .collect()
+    }
+
+    /// 单个词的 logit：wte 的这一行和最后一层输出做点积，编号越界就夹到最后一个字。
+    fn logit(&self, tok: u32, y: &[f32]) -> f32 {
+        let t = (tok as usize).min(self.vocab_size - 1);
+        dot(&self.wte[t * D..(t + 1) * D], y)
+    }
+
+    /// 保证 seq 和它所有前缀的状态都在缓存里。
+    fn ensure(&self, cache: &mut Cache, seq: &[u32]) {
+        let clock = cache.clock;
+        let mut have = seq.len();
+        while have > 0 {
+            if let Some(s) = cache.states.get_mut(&seq[..have]) {
+                s.used = clock;
+                break;
+            }
+            have -= 1;
+        }
+        // 前面的状态也标成刚用过，免得马上被清掉
+        for i in 1..have {
+            if let Some(s) = cache.states.get_mut(&seq[..i]) {
+                s.used = clock;
+            }
+        }
+        for end in (have + 1)..=seq.len() {
+            let state = {
+                let past: Vec<&State> = (1..end)
+                    .map(|i| cache.states.get(&seq[..i]).expect("前缀已算"))
+                    .collect();
+                self.step(seq[end - 1], end - 1, &past, clock)
+            };
+            cache.states.insert(seq[..end].to_vec(), state);
+        }
+    }
+
+    /// 前向一步：词嵌入 + 位置嵌入，逐层的 LayerNorm/注意力（带 past 的 k、v）/前馈，
+    /// 最后算出整张词表上的 log-sum-exp 存进 State。
+    fn step(&self, tok: u32, pos: usize, past: &[&State], clock: u64) -> State {
+        let t = (tok as usize).min(self.vocab_size - 1);
+        let mut x: Vec<f32> = (0..D)
+            .map(|i| self.wte[t * D + i] + self.wpe[pos * D + i])
+            .collect();
+        let mut kv = vec![0.0f32; LAYERS * 2 * D];
+        let mut a = vec![0.0f32; D];
+        let mut qkv = vec![0.0f32; 3 * D];
+        let mut o = vec![0.0f32; D];
+        let mut h = vec![0.0f32; FF];
+        let mut scores = vec![0.0f32; past.len() + 1];
+        for (l, layer) in self.layers.iter().enumerate() {
+            layer_norm(&x, &layer.ln1_g, &layer.ln1_b, &mut a);
+            matvec(&layer.attn_w, &layer.attn_b, &a, &mut qkv);
+            let (q, rest) = qkv.split_at(D);
+            let (k, v) = rest.split_at(D);
+            kv[(l * 2) * D..(l * 2 + 1) * D].copy_from_slice(k);
+            kv[(l * 2 + 1) * D..(l * 2 + 2) * D].copy_from_slice(v);
+            for head in 0..HEADS {
+                let r = head * HEAD_DIM..(head + 1) * HEAD_DIM;
+                let qh = &q[r.clone()];
+                for (j, p) in past.iter().enumerate() {
+                    let pk = &p.kv[(l * 2) * D..(l * 2 + 1) * D];
+                    scores[j] = dot(qh, &pk[r.clone()]) * 0.125;
+                }
+                scores[past.len()] = dot(qh, &k[r.clone()]) * 0.125;
+                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0;
+                for s in scores.iter_mut() {
+                    *s = (*s - max).exp();
+                    sum += *s;
+                }
+                let oh = &mut o[r.clone()];
+                oh.iter_mut().for_each(|x| *x = 0.0);
+                for (j, p) in past.iter().enumerate() {
+                    let pv = &p.kv[(l * 2 + 1) * D..(l * 2 + 2) * D];
+                    let w = scores[j] / sum;
+                    for (dst, src) in oh.iter_mut().zip(&pv[r.clone()]) {
+                        *dst += w * src;
+                    }
+                }
+                let w = scores[past.len()] / sum;
+                for (dst, src) in oh.iter_mut().zip(&v[r.clone()]) {
+                    *dst += w * src;
+                }
+            }
+            matvec_add(&layer.proj_w, &layer.proj_b, &o, &mut x);
+            layer_norm(&x, &layer.ln2_g, &layer.ln2_b, &mut a);
+            matvec(&layer.fc_w, &layer.fc_b, &a, &mut h);
+            h.iter_mut().for_each(|v| *v = gelu(*v));
+            matvec_add(&layer.out_w, &layer.out_b, &h, &mut x);
+        }
+        let mut y = vec![0.0f32; D];
+        layer_norm(&x, &self.lnf_g, &self.lnf_b, &mut y);
+        // log-sum-exp over 全部词表
+        let mut max = f32::NEG_INFINITY;
+        let logits: Vec<f32> = self
+            .wte
+            .chunks_exact(D)
+            .map(|row| {
+                let v = dot(row, &y);
+                max = max.max(v);
+                v
+            })
+            .collect();
+        let sum: f32 = logits.iter().map(|v| (v - max).exp()).sum();
+        State {
+            kv,
+            y,
+            lse: max + sum.ln(),
+            used: clock,
+        }
+    }
+}
+
+impl Cache {
+    /// 清掉最久没用的一半。
+    fn evict(&mut self) {
+        let mut ages: Vec<u64> = self.states.values().map(|s| s.used).collect();
+        ages.sort_unstable();
+        let cut = ages[ages.len() / 2];
+        self.states.retain(|_, s| s.used > cut);
+    }
+}
+
+/// 点积：八路累加（等于开了几个累加器，压住浮点加法的依赖链），尾巴逐项扫。
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    let (ca, ra) = a.split_at(a.len() / 8 * 8);
+    let (cb, rb) = b.split_at(ca.len());
+    for (x, y) in ca.chunks_exact(8).zip(cb.chunks_exact(8)) {
+        for i in 0..8 {
+            acc[i] += x[i] * y[i];
+        }
+    }
+    let mut s: f32 = acc.iter().sum();
+    for (x, y) in ra.iter().zip(rb) {
+        s += x * y;
+    }
+    s
+}
+
+/// out = W·x + b，W 按 [out, in] 行存。
+fn matvec(w: &[f32], b: &[f32], x: &[f32], out: &mut [f32]) {
+    for ((o, row), bias) in out.iter_mut().zip(w.chunks_exact(x.len())).zip(b) {
+        *o = dot(row, x) + bias;
+    }
+}
+
+/// out += W·x + b。
+fn matvec_add(w: &[f32], b: &[f32], x: &[f32], out: &mut [f32]) {
+    for ((o, row), bias) in out.iter_mut().zip(w.chunks_exact(x.len())).zip(b) {
+        *o += dot(row, x) + bias;
+    }
+}
+
+/// out = (x - 均值) / sqrt(方差 + 1e-5) * g + b，方差按总体算（和训练时一致）。
+fn layer_norm(x: &[f32], g: &[f32], b: &[f32], out: &mut [f32]) {
+    let n = x.len() as f32;
+    let mean = x.iter().sum::<f32>() / n;
+    let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
+    let inv = 1.0 / (var + 1e-5).sqrt();
+    for i in 0..x.len() {
+        out[i] = (x[i] - mean) * inv * g[i] + b[i];
+    }
+}
+
+/// tanh 近似的 GELU（GPT-2 用的那个，和 TFLite 里的一致）。
+fn gelu(x: f32) -> f32 {
+    const C: f32 = 0.797_884_6; // sqrt(2/pi)
+    0.5 * x * (1.0 + (C * (x + 0.044715 * x * x * x)).tanh())
+}
+
+/// Flype 自己格式的文件头。
+const WTNN_MAGIC: &[u8; 4] = b"WTNN";
+
+/// IEEE 754 半精度 -> 单精度。
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h >> 15) as u32) << 31;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let frac = (h & 0x3ff) as u32;
+    let bits = match exp {
+        0 if frac == 0 => sign,
+        0 => {
+            // 非规格化数：规格化以后再拼
+            let mut e = 127 - 15 + 1;
+            let mut f = frac;
+            while f & 0x400 == 0 {
+                f <<= 1;
+                e -= 1;
+            }
+            sign | (e << 23) | ((f & 0x3ff) << 13)
+        }
+        0x1f => sign | 0x7f80_0000 | (frac << 13),
+        _ => sign | ((exp + 127 - 15) << 23) | (frac << 13),
+    };
+    f32::from_bits(bits)
+}
+
+/// 读一个小端 u32；越界报错而不是 panic（文件可能是坏的或被截断的）。
+fn u32_at(d: &[u8], at: usize) -> Result<u32> {
+    let b = d.get(at..at + 4).context("越界")?;
+    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// 读一个小端 u16；越界报错。
+fn u16_at(d: &[u8], at: usize) -> Result<u16> {
+    let b = d.get(at..at + 2).context("越界")?;
+    Ok(u16::from_le_bytes([b[0], b[1]]))
+}
+
+/// 字表哈希表：TFLite 段后面第一个 `flags=0x80000001` 的表。
+///
+/// 表头：flags u32、桶数 u32，然后每桶一个相对表头的 u32 偏移。每桶：n、n 个哈希、
+/// n 个 u16（各值的累计结束偏移）、值字节。字的值是 `04 01 <u16 码位> <u8 编号>` 或
+/// `14 01 <u16 码位> <u16 编号>`；`<s>` 这类特殊符号的值是别的格式，跳过（编号是约定好的）。
+fn read_vocab(data: &[u8], from: usize) -> Result<HashMap<char, u32>> {
+    let mut at = from;
+    let table = loop {
+        if at + 12 > data.len() || at > from + 4096 {
+            bail!("找不到字表");
+        }
+        let flags = u32_at(data, at)?;
+        let buckets = u32_at(data, at + 4)? as usize;
+        if flags == 0x8000_0001 && (1000..100_000).contains(&buckets) {
+            break at;
+        }
+        at += 1;
+    };
+    let buckets = u32_at(data, table + 4)? as usize;
+    let mut vocab = HashMap::new();
+    for b in 0..buckets {
+        let off = u32_at(data, table + 8 + 4 * b)? as usize;
+        let base = table + off;
+        let n = u32_at(data, base)? as usize;
+        let ends = base + 4 + 4 * n;
+        let values = ends + 2 * n;
+        let mut prev = 0usize;
+        for i in 0..n {
+            let end = u16_at(data, ends + 2 * i)? as usize;
+            let v = data
+                .get(values + prev..values + end)
+                .context("字表值越界")?;
+            prev = end;
+            let (cp, id) = match v {
+                [0x04, 0x01, a, b, id] => (u16::from_le_bytes([*a, *b]) as u32, *id as u32),
+                [0x14, 0x01, a, b, i0, i1] => (
+                    u16::from_le_bytes([*a, *b]) as u32,
+                    u16::from_le_bytes([*i0, *i1]) as u32,
+                ),
+                _ => continue,
+            };
+            if let Some(ch) = char::from_u32(cp) {
+                vocab.insert(ch, id);
+            }
+        }
+    }
+    if vocab.len() < 1000 {
+        bail!("字表只读出 {} 个字", vocab.len());
+    }
+    Ok(vocab)
+}
+
+// ---- 最小的 TFLite（FlatBuffers）读取：只取 float32 常量张量的名字、形状和数据 ----
+
+/// FlatBuffers 读取器：只按字段号算偏移，不做任何校验。
+struct Fb<'a> {
+    /// 整个文件内容。
+    d: &'a [u8],
+}
+
+impl<'a> Fb<'a> {
+    /// 读一个 u32。
+    fn u32(&self, at: usize) -> Result<u32> {
+        u32_at(self.d, at)
+    }
+    /// 表的第 field 个字段的位置（没有这个字段返回 None）。
+    fn field(&self, table: usize, field: usize) -> Result<Option<usize>> {
+        let soff = self.u32(table)? as i32;
+        let vt = (table as i64 - soff as i64) as usize;
+        let vt_len = u16_at(self.d, vt)? as usize;
+        let slot = 4 + 2 * field;
+        if slot + 2 > vt_len {
+            return Ok(None);
+        }
+        let off = u16_at(self.d, vt + slot)? as usize;
+        Ok((off != 0).then_some(table + off))
+    }
+    /// 解引用：at 处存的是相对它自己的偏移。
+    fn deref(&self, at: usize) -> Result<usize> {
+        Ok(at + self.u32(at)? as usize)
+    }
+    /// field 指向子表时，返回子表的位置（不是指针字段）。
+    fn table_field(&self, table: usize, field: usize) -> Result<Option<usize>> {
+        match self.field(table, field)? {
+            Some(at) => Ok(Some(self.deref(at)?)),
+            None => Ok(None),
+        }
+    }
+    /// 向量：(元素起点, 长度)。
+    fn vector(&self, table: usize, field: usize) -> Result<Option<(usize, usize)>> {
+        match self.table_field(table, field)? {
+            Some(v) => Ok(Some((v + 4, self.u32(v)? as usize))),
+            None => Ok(None),
+        }
+    }
+}
+
+/// 从 TFLite 里抠出所有 float32 常量张量：名字 -> (形状, 数据)。只看第一个 subgraph，
+/// 非 float32、没有数据的张量跳过（推理只要权重常量，不要算子）。
+#[allow(clippy::type_complexity)]
+fn read_tflite_tensors(d: &[u8]) -> Result<HashMap<String, (Vec<usize>, Vec<f32>)>> {
+    let fb = Fb { d };
+    let root = fb.deref(0)?;
+    let (subgraphs, n_sub) = fb.vector(root, 2)?.context("没有 subgraphs")?;
+    let (buffers, n_buf) = fb.vector(root, 4)?.context("没有 buffers")?;
+    if n_sub == 0 {
+        bail!("subgraphs 为空");
+    }
+    let sub = fb.deref(subgraphs)?;
+    let (tensors, n_t) = fb.vector(sub, 0)?.context("没有 tensors")?;
+    let mut out = HashMap::new();
+    for i in 0..n_t {
+        let t = fb.deref(tensors + 4 * i)?;
+        // Tensor: shape(0) type(1) buffer(2) name(3)
+        let ty = match fb.field(t, 1)? {
+            Some(at) => *d.get(at).context("越界")?,
+            None => 0,
+        };
+        if ty != 0 {
+            continue; // 只要 FLOAT32
+        }
+        let buf_idx = match fb.field(t, 2)? {
+            Some(at) => fb.u32(at)? as usize,
+            None => 0,
+        };
+        if buf_idx == 0 || buf_idx >= n_buf {
+            continue;
+        }
+        let buffer = fb.deref(buffers + 4 * buf_idx)?;
+        let Some((data_at, len)) = fb.vector(buffer, 0)? else {
+            continue;
+        };
+        if len == 0 || len % 4 != 0 {
+            continue;
+        }
+        let name = match fb.table_field(t, 3)? {
+            Some(s) => {
+                let n = fb.u32(s)? as usize;
+                String::from_utf8_lossy(d.get(s + 4..s + 4 + n).context("越界")?).into_owned()
+            }
+            None => continue,
+        };
+        let shape = match fb.vector(t, 0)? {
+            Some((at, n)) => (0..n)
+                .map(|j| fb.u32(at + 4 * j).map(|v| v as usize))
+                .collect::<Result<Vec<_>>>()?,
+            None => Vec::new(),
+        };
+        let bytes = d.get(data_at..data_at + len).context("张量数据越界")?;
+        let values: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        out.insert(name, (shape, values));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 测试用的 f32 -> f16：截断尾数，只够表示 [-1, 1] 的规格化小数。
+    fn f32_to_f16(v: f32) -> u16 {
+        // 测试里只用到 [-1, 1] 的规格化小数，截断就够
+        let bits = v.to_bits();
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        if v == 0.0 {
+            return sign;
+        }
+        let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+        sign | ((exp as u16) << 10) | ((bits >> 13) & 0x3ff) as u16
+    }
+
+    /// 验证 f16 -> f32：规格化数往返能还原，最小的非规格化数、无穷也对。
+    #[test]
+    fn half_precision() {
+        for v in [0.0f32, 1.0, -2.5, 0.000_061_035_156, 65504.0, 0.333_251_95] {
+            assert_eq!(f16_to_f32(f32_to_f16(v)), v, "{v}");
+        }
+        assert_eq!(f16_to_f32(0x0001), 5.960_464_5e-8); // 最小的非规格化数
+        assert!(f16_to_f32(0x7c00).is_infinite());
+    }
+
+    /// 造一个随机权重的 WTNN 文件：能读、打分是有限数、字表和说明都读出来；截断了要报错。
+    #[test]
+    fn reads_wtnn() {
+        let vocab_size = 1100usize;
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"WTNN");
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        let meta = "flype-data: nnlm.bin 2026.1.1.0 test\n{\"name\":\"flype-nnlm\"}".as_bytes();
+        blob.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        blob.extend_from_slice(meta);
+        for v in [vocab_size as u32, 2] {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        for (cp, id) in [('你' as u32, 3u32), ('好' as u32, 4)] {
+            blob.extend_from_slice(&cp.to_le_bytes());
+            blob.extend_from_slice(&id.to_le_bytes());
+        }
+        let per_layer = 4 * D + 3 * D * D + 3 * D + D * D + D + 2 * FF * D + FF + D;
+        let total = vocab_size * D + MAX_POS * D + LAYERS * per_layer + 2 * D;
+        let mut seed = 7u32;
+        for _ in 0..total {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let v = ((seed >> 8) % 2001) as f32 / 1000.0 - 1.0;
+            blob.extend_from_slice(&f32_to_f16(v * 0.05).to_le_bytes());
+        }
+        let model = Nnlm::from_bytes(&blob).expect("读得出来");
+        assert_eq!(model.vocab_size(), vocab_size);
+        assert_eq!(model.token('你'), 3);
+        assert_eq!(model.token('他'), UNK);
+        assert!(model.meta().unwrap().starts_with("flype-data: nnlm.bin 2026.1.1.0"));
+        assert!(crate::datamark::scan(&blob).is_some_and(|m| m.version == "2026.1.1.0"));
+        let s = model.score(&model.context_tokens("我说"), "你好");
+        assert!(s.is_finite() && s < 0.0, "{s}");
+        assert!(Nnlm::from_bytes(&blob[..blob.len() / 2]).is_err());
+        let mut bad = blob.clone();
+        bad[4] = 9;
+        assert!(Nnlm::from_bytes(&bad).is_err());
+    }
+
+    /// 本机有模型文件时才跑（模型不随仓库分发）。FLYPE_NNLM 可指定路径。
+    fn model() -> Option<Nnlm> {
+        let path = std::env::var("FLYPE_NNLM").ok().or_else(|| {
+            let home = std::env::var("HOME").ok()?;
+            Some(format!(
+                "{home}/.local/share/flype/wetype/nlrgpt2_nnlm.bin"
+            ))
+        })?;
+        if !Path::new(&path).exists() {
+            eprintln!("没有 {path}，跳过");
+            return None;
+        }
+        Some(Nnlm::load(path).expect("加载模型"))
+    }
+
+    /// 验证真模型的分数和 TFLite 官方运行时对得上：字表编号、错字掉十几个、
+    /// 「在/再」这类同音分得开、top1 出来的是通顺的字。
+    #[test]
+    fn matches_reference_scores() {
+        let Some(m) = model() else { return };
+        assert_eq!(m.vocab_size(), 5594);
+        assert_eq!(m.token('，'), 4);
+        assert_eq!(m.token('的'), 5);
+        // 数值来自 TFLite 官方运行时（LiteRT）
+        let bos = [BOS];
+        let a = m.score(&bos, "我今天很开心");
+        assert!((a + 15.28).abs() < 0.05, "{a}");
+        let b = m.score(&bos, "我今天很开薪");
+        assert!(b < a - 15.0, "{b}");
+        assert!(m.score(&bos, "我在家里") > m.score(&bos, "我再家里") + 5.0);
+        let ctx = m.context_tokens("今天天气");
+        let top: String = m.top_next(&ctx, 3).into_iter().map(|(c, _)| c).collect();
+        assert!(top.contains('好'), "{top}");
+    }
+
+    /// 验证前缀缓存不改结果：同一个前缀连算两次完全相同，清掉缓存重算只差 1e-4 以内。
+    #[test]
+    fn cache_gives_same_result() {
+        let Some(m) = model() else { return };
+        let ctx = m.context_tokens("我们明天");
+        let first = m.score(&ctx, "一起去吃饭");
+        let again = m.score(&ctx, "一起去吃饭");
+        assert_eq!(first, again);
+        m.cache.lock().unwrap().states.clear();
+        let fresh = m.score(&ctx, "一起去吃饭");
+        assert!((first - fresh).abs() < 1e-4);
+    }
+}

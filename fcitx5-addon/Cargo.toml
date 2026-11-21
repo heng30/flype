@@ -1,0 +1,25 @@
+[package]
+name = "flype-fcitx5"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+description = "Flype 的 fcitx5 插件（C++ 引擎 + cargo 构建）"
+
+[lib]
+name = "flype"
+crate-type = ["cdylib"]
+
+# 按键行为测试（scripts/addon-test.sh 用）；用例在 test/key_harness.cpp
+[[bin]]
+name = "flype-key-harness"
+path = "src/bin/key_harness.rs"
+required-features = ["key-harness"]
+
+[dependencies]
+flype-core.workspace = true
+
+[build-dependencies]
+cc.workspace = true
+
+[features]
+key-harness = []

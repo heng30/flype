@@ -1,0 +1,1263 @@
+//! C ABI：供 fcitx5 的 C++ 插件通过 cdylib 调用。
+//!
+//! 设计成“不透明句柄 + 候选句柄”，避免 C++ 侧解析 JSON。字符串一律 UTF-8。
+
+// 安全契约见 core/include/flype_core.h：空指针、句柄生命周期由调用方保证。
+#![allow(clippy::missing_safety_doc)]
+
+use std::cell::RefCell;
+use std::ffi::{CStr, CString};
+use std::os::raw::{c_char, c_int};
+use std::panic;
+use std::ptr;
+use std::sync::Arc;
+
+use crate::lexicon::{Lexicon, MemoryLexicon};
+use crate::lm::{BigramLm, LanguageModel};
+use crate::Engine;
+
+thread_local! {
+    /// 本线程最近一次错误，`flype_last_error` 返回的指针指向它
+    static LAST_ERROR: RefCell<CString> =
+        RefCell::new(CString::new("no error").expect("static error string"));
+}
+
+/// 记下错误文本（NUL 换成空格，免得 C 侧读一半），给 `flype_last_error` 用
+pub(crate) fn set_last_error(message: impl Into<String>) {
+    let text = message.into().replace('\0', " ");
+    let value = CString::new(text)
+        .unwrap_or_else(|_| CString::new("unknown error").expect("static error string"));
+    LAST_ERROR.with(|slot| *slot.borrow_mut() = value);
+}
+
+/// C 字符串转 &str：空指针、不是 UTF-8 都返回 None
+unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
+    if ptr.is_null() {
+        return None;
+    }
+    unsafe { CStr::from_ptr(ptr) }.to_str().ok()
+}
+
+/// 引擎句柄。
+pub struct FlypeEngineHandle {
+    /// 引擎本体，外壳拿到的句柄就是它。
+    pub(crate) engine: Engine,
+}
+
+/// 一次输入产生的候选集合（预测结果也用这个结构承载）。
+pub struct FlypeCandidates {
+    /// 候选文本（UTF-8），和后面的几个数组一一对应。
+    texts: Vec<CString>,
+    /// 和 texts 对应的分数，越大越靠前。
+    scores: Vec<f64>,
+    /// 候选对应的拼音（空格分隔音节）；预测、符号结果为空串。
+    pinyins: Vec<CString>,
+    /// 候选用掉了输入的多少字节；整句候选等于输入长度。
+    consumed: Vec<usize>,
+    /// 选中后上屏的文字（emoji 推荐用）；空表示就是 text。
+    commits: Vec<CString>,
+}
+
+impl FlypeCandidates {
+    /// 只有文本和分数的结果（预测、符号）。
+    pub(crate) fn plain(texts: Vec<CString>, scores: Vec<f64>) -> Self {
+        let n = texts.len();
+        Self {
+            texts,
+            scores,
+            pinyins: vec![CString::default(); n],
+            consumed: vec![0; n],
+            commits: Vec::new(),
+        }
+    }
+}
+
+/// 创建引擎。
+///
+/// lexicon_tsv_path 必填；bigram_tsv_path 可为 NULL/空串，表示不加载 LM。
+/// 失败返回 NULL，错误信息用 flype_last_error 获取。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_new(
+    lexicon_tsv_path: *const c_char,
+    bigram_tsv_path: *const c_char,
+) -> *mut FlypeEngineHandle {
+    let lexicon_path = match unsafe { cstr_to_str(lexicon_tsv_path) } {
+        Some(path) if !path.is_empty() => path,
+        _ => {
+            set_last_error("lexicon path is null or empty");
+            return ptr::null_mut();
+        }
+    };
+
+    let result = (|| -> anyhow::Result<Engine> {
+        let lexicon = MemoryLexicon::from_tsv_path_cached(lexicon_path)?;
+        let lexicon: Arc<dyn Lexicon> = Arc::new(lexicon);
+        let lm: Arc<dyn LanguageModel> = match unsafe { cstr_to_str(bigram_tsv_path) } {
+            Some(path) if !path.is_empty() => crate::lm::load_lm(path)?,
+            _ => Arc::new(BigramLm::default()),
+        };
+        let engine = Engine::new(lexicon, lm);
+        // 外壳都在后台线程里载入引擎：模糊音索引（兜底默认开）也在这时建好，不留到第一次按键
+        engine.prepare_fuzzy();
+        Ok(engine)
+    })();
+
+    match result {
+        Ok(engine) => Box::into_raw(Box::new(FlypeEngineHandle { engine })),
+        Err(error) => {
+            set_last_error(format!("{error:#}"));
+            ptr::null_mut()
+        }
+    }
+}
+
+/// 释放引擎。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_free(engine: *mut FlypeEngineHandle) {
+    if !engine.is_null() {
+        drop(unsafe { Box::from_raw(engine) });
+    }
+}
+
+/// 设置 beam size；返回 0 成功，-1 失败。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_set_beam_size(
+    engine: *mut FlypeEngineHandle,
+    beam_size: u32,
+) -> c_int {
+    match unsafe { engine.as_mut() } {
+        Some(handle) => {
+            handle.engine.set_beam_size(beam_size as usize);
+            0
+        }
+        None => {
+            set_last_error("engine handle is null");
+            -1
+        }
+    }
+}
+
+/// 输入拼音串，返回候选句柄；失败返回 NULL。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_input(
+    engine: *mut FlypeEngineHandle,
+    input: *const c_char,
+) -> *mut FlypeCandidates {
+    let handle = match unsafe { engine.as_ref() } {
+        Some(handle) => handle,
+        None => {
+            set_last_error("engine handle is null");
+            return ptr::null_mut();
+        }
+    };
+    let input = match unsafe { cstr_to_str(input) } {
+        Some(input) => input,
+        None => {
+            set_last_error("input is null or not valid UTF-8");
+            return ptr::null_mut();
+        }
+    };
+
+    let outcome = panic::catch_unwind(panic::AssertUnwindSafe(|| handle.engine.try_input(input)));
+    match outcome {
+        Ok(Ok(candidates)) => {
+            let mut texts = Vec::with_capacity(candidates.len());
+            let mut scores = Vec::with_capacity(candidates.len());
+            let mut pinyins = Vec::with_capacity(candidates.len());
+            let mut consumed = Vec::with_capacity(candidates.len());
+            for candidate in candidates {
+                let text = candidate.text.replace('\0', " ");
+                texts.push(CString::new(text).unwrap_or_default());
+                scores.push(candidate.score);
+                pinyins.push(CString::new(candidate.pinyin.replace('\0', " ")).unwrap_or_default());
+                consumed.push(candidate.consumed.min(input.len()));
+            }
+            Box::into_raw(Box::new(FlypeCandidates {
+                texts,
+                scores,
+                pinyins,
+                consumed,
+                commits: Vec::new(),
+            }))
+        }
+        Ok(Err(error)) => {
+            set_last_error(format!("{error:#}"));
+            ptr::null_mut()
+        }
+        Err(_) => {
+            set_last_error("Rust panic while processing input");
+            ptr::null_mut()
+        }
+    }
+}
+
+/// 基于上一词的预测（预测词库）。
+///
+/// 成功返回候选集合句柄（text 是预测词，score 是对数概率），
+/// 失败返回 NULL；结果同样用 flype_candidates_free 释放。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_predict_next(
+    engine: *const FlypeEngineHandle,
+    prev_word: *const c_char,
+    limit: usize,
+) -> *mut FlypeCandidates {
+    let outcome = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        if engine.is_null() {
+            set_last_error("engine is null");
+            return ptr::null_mut();
+        }
+        let Some(prev) = (unsafe { cstr_to_str(prev_word) }) else {
+            set_last_error("prev_word is null or not utf8");
+            return ptr::null_mut();
+        };
+        let items = unsafe { &*engine }.engine.predict_next(prev, limit);
+        let mut texts = Vec::with_capacity(items.len());
+        let mut scores = Vec::with_capacity(items.len());
+        for (word, score) in items {
+            match CString::new(word) {
+                Ok(text) => {
+                    texts.push(text);
+                    scores.push(score);
+                }
+                Err(_) => continue,
+            }
+        }
+        Box::into_raw(Box::new(FlypeCandidates::plain(texts, scores)))
+    }));
+    match outcome {
+        Ok(candidates) => candidates,
+        Err(_) => {
+            set_last_error("panic in flype_engine_predict_next");
+            ptr::null_mut()
+        }
+    }
+}
+
+/// 记录一次选词，用于历史特征。返回 0 表示成功。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_record_selection(
+    engine: *mut FlypeEngineHandle,
+    word: *const c_char,
+) -> c_int {
+    if engine.is_null() {
+        set_last_error("engine is null");
+        return -1;
+    }
+    let Some(word) = (unsafe { cstr_to_str(word) }) else {
+        set_last_error("word is null or not utf8");
+        return -1;
+    };
+    unsafe { &*engine }.engine.record_selection(word);
+    0
+}
+
+/// 设置光标前文本，用于上下文 bigram 特征。返回 0 表示成功。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_set_context(
+    engine: *mut FlypeEngineHandle,
+    text: *const c_char,
+) -> c_int {
+    if engine.is_null() {
+        set_last_error("engine is null");
+        return -1;
+    }
+    let Some(text) = (unsafe { cstr_to_str(text) }) else {
+        set_last_error("context is null or not utf8");
+        return -1;
+    };
+    unsafe { &*engine }.engine.set_context(text);
+    0
+}
+
+/// 添加用户词。返回 0 成功，-1 失败（拼音非法等）。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_add_user_word(
+    engine: *mut FlypeEngineHandle,
+    pinyin: *const c_char,
+    word: *const c_char,
+) -> c_int {
+    if engine.is_null() {
+        set_last_error("engine is null");
+        return -1;
+    }
+    let (Some(pinyin), Some(word)) = (unsafe { cstr_to_str(pinyin) }, unsafe { cstr_to_str(word) })
+    else {
+        set_last_error("pinyin or word is null/not utf8");
+        return -1;
+    };
+    match unsafe { &*engine }
+        .engine
+        .add_user_word(pinyin, word, 5000.0)
+    {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(format!("{e:#}"));
+            -1
+        }
+    }
+}
+
+/// 删除用户词。返回 1 删掉了，0 没找到，-1 出错。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_remove_user_word(
+    engine: *mut FlypeEngineHandle,
+    word: *const c_char,
+) -> c_int {
+    if engine.is_null() {
+        set_last_error("engine is null");
+        return -1;
+    }
+    let Some(word) = (unsafe { cstr_to_str(word) }) else {
+        set_last_error("word is null or not utf8");
+        return -1;
+    };
+    if unsafe { &*engine }.engine.remove_user_word(word) {
+        1
+    } else {
+        0
+    }
+}
+
+/// 保存用户词到 TSV。返回 0 成功，-1 失败。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_save_user_dict(
+    engine: *mut FlypeEngineHandle,
+    path: *const c_char,
+) -> c_int {
+    if engine.is_null() {
+        set_last_error("engine is null");
+        return -1;
+    }
+    let Some(path) = (unsafe { cstr_to_str(path) }) else {
+        set_last_error("path is null or not utf8");
+        return -1;
+    };
+    match unsafe { &*engine }.engine.save_user_dict(path) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(format!("{e:#}"));
+            -1
+        }
+    }
+}
+
+/// 从 TSV 载入用户词，返回载入条数，-1 表示出错。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_load_user_dict(
+    engine: *mut FlypeEngineHandle,
+    path: *const c_char,
+) -> c_int {
+    if engine.is_null() {
+        set_last_error("engine is null");
+        return -1;
+    }
+    let Some(path) = (unsafe { cstr_to_str(path) }) else {
+        set_last_error("path is null or not utf8");
+        return -1;
+    };
+    match unsafe { &*engine }.engine.load_user_dict(path) {
+        Ok(n) => n as c_int,
+        Err(e) => {
+            set_last_error(format!("{e:#}"));
+            -1
+        }
+    }
+}
+
+/// 读自定义词文件（`拼音<TAB>词[<TAB>频次]`，设置界面写的 custom.tsv），整体替换上一次读到的；
+/// 文件不存在就清空。返回收下的条数，-1 出错。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_load_custom_words(
+    engine: *mut FlypeEngineHandle,
+    path: *const c_char,
+) -> c_int {
+    if engine.is_null() {
+        set_last_error("engine is null");
+        return -1;
+    }
+    let Some(path) = (unsafe { cstr_to_str(path) }) else {
+        set_last_error("path is null or not utf8");
+        return -1;
+    };
+    match unsafe { &*engine }.engine.load_custom_words(path) {
+        Ok(n) => n as c_int,
+        Err(e) => {
+            set_last_error(format!("{e:#}"));
+            -1
+        }
+    }
+}
+
+/// 保存用户输入习惯（选过的词的热度、词搭配）到 TSV。返回 0 成功，-1 失败。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_save_history(
+    engine: *mut FlypeEngineHandle,
+    path: *const c_char,
+) -> c_int {
+    if engine.is_null() {
+        set_last_error("engine is null");
+        return -1;
+    }
+    let Some(path) = (unsafe { cstr_to_str(path) }) else {
+        set_last_error("path is null or not utf8");
+        return -1;
+    };
+    match unsafe { &*engine }.engine.save_history(path) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(format!("{e:#}"));
+            -1
+        }
+    }
+}
+
+/// 在后台存用户词库（1.11）：在锁里抄一份就返回，写文件在存盘的线程上。返回 0 交出去了，-1 参数不对。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_save_user_dict_async(
+    engine: *mut FlypeEngineHandle,
+    path: *const c_char,
+) -> c_int {
+    unsafe { save_async(engine, path, |engine, path| engine.save_user_dict_async(path)) }
+}
+
+/// 在后台存用户输入习惯（1.11），同 [`flype_engine_save_user_dict_async`]。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_save_history_async(
+    engine: *mut FlypeEngineHandle,
+    path: *const c_char,
+) -> c_int {
+    unsafe { save_async(engine, path, |engine, path| engine.save_history_async(path)) }
+}
+
+/// 两个后台存盘的共同部分：查完 engine 和 path 就把存盘交给 saver 线程，不在这里写文件
+unsafe fn save_async(
+    engine: *mut FlypeEngineHandle,
+    path: *const c_char,
+    save: impl FnOnce(&Engine, &str) -> anyhow::Result<()>,
+) -> c_int {
+    if engine.is_null() {
+        set_last_error("engine is null");
+        return -1;
+    }
+    let Some(path) = (unsafe { cstr_to_str(path) }).filter(|p| !p.is_empty()) else {
+        set_last_error("path is null, empty or not utf8");
+        return -1;
+    };
+    match save(&unsafe { &*engine }.engine, path) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(format!("{e:#}"));
+            -1
+        }
+    }
+}
+
+/// 等后台存盘写完（1.11）。timeout_ms 小于 0 一直等，否则最多等这么久（0 只看一眼）。
+/// 返回 0：都写完了，上次调用以后交的都写成了；1：还没写完；-1：上次调用以后有写失败的
+/// （原因在 flype_last_error，只报一次），或者 engine 是 NULL。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_save_wait(
+    engine: *mut FlypeEngineHandle,
+    timeout_ms: c_int,
+) -> c_int {
+    let Some(handle) = (unsafe { engine.as_ref() }) else {
+        set_last_error("engine is null");
+        return -1;
+    };
+    let timeout = u64::try_from(timeout_ms).ok().map(std::time::Duration::from_millis);
+    match handle.engine.save_wait(timeout) {
+        crate::saver::SaveStatus::Done => 0,
+        crate::saver::SaveStatus::Pending => 1,
+        crate::saver::SaveStatus::Failed(e) => {
+            set_last_error(e);
+            -1
+        }
+    }
+}
+
+/// 读回用户输入习惯，返回条数，-1 表示出错（文件不存在也是 -1）。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_load_history(
+    engine: *mut FlypeEngineHandle,
+    path: *const c_char,
+) -> c_int {
+    if engine.is_null() {
+        set_last_error("engine is null");
+        return -1;
+    }
+    let Some(path) = (unsafe { cstr_to_str(path) }) else {
+        set_last_error("path is null or not utf8");
+        return -1;
+    };
+    match unsafe { &*engine }.engine.load_history(path) {
+        Ok(n) => n as c_int,
+        Err(e) => {
+            set_last_error(format!("{e:#}"));
+            -1
+        }
+    }
+}
+
+/// 每次输入最多返回多少个整句候选（句首词候选另算）。返回 0 成功，-1 失败。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_set_max_candidates(
+    engine: *mut FlypeEngineHandle,
+    max_candidates: u32,
+) -> c_int {
+    if engine.is_null() {
+        set_last_error("engine is null");
+        return -1;
+    }
+    unsafe { &mut *engine }
+        .engine
+        .set_max_candidates(max_candidates as usize);
+    0
+}
+
+/// 开关按错键纠错（相邻键、两键按反、多按/漏按）。返回 0 成功，-1 失败。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_set_typo_correction(
+    engine: *mut FlypeEngineHandle,
+    on: c_int,
+) -> c_int {
+    if engine.is_null() {
+        set_last_error("engine is null");
+        return -1;
+    }
+    unsafe { &mut *engine }.engine.set_typo_correction(on != 0);
+    0
+}
+
+/// 是否也出 CJK 扩展 B 区及以后的单字（ABI 1.9 起，默认不出；通用规范汉字表里的照常）。返回 0 成功，-1 失败。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_set_rare_ext_chars(
+    engine: *mut FlypeEngineHandle,
+    on: c_int,
+) -> c_int {
+    if engine.is_null() {
+        set_last_error("engine is null");
+        return -1;
+    }
+    unsafe { &mut *engine }.engine.set_rare_ext_chars(on != 0);
+    0
+}
+
+/// 载入英文词表（每行一个词，或 rime 的 en.dict.yaml），返回累计词条数；失败返回 -1。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_load_english(
+    engine: *mut FlypeEngineHandle,
+    path: *const c_char,
+) -> c_int {
+    if engine.is_null() {
+        set_last_error("engine is null");
+        return -1;
+    }
+    let Some(path) = (unsafe { cstr_to_str(path) }) else {
+        set_last_error("path is null or not utf8");
+        return -1;
+    };
+    match unsafe { &*engine }.engine.load_english(path) {
+        Ok(n) => n.min(c_int::MAX as usize) as c_int,
+        Err(e) => {
+            set_last_error(format!("{e:#}"));
+            -1
+        }
+    }
+}
+
+/// 载入字级神经语言模型（微信输入法的 nlrgpt2_nnlm.bin）。返回字表大小，失败返回 -1。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_load_nnlm(
+    engine: *mut FlypeEngineHandle,
+    path: *const c_char,
+) -> c_int {
+    if engine.is_null() {
+        set_last_error("engine is null");
+        return -1;
+    }
+    let Some(path) = (unsafe { cstr_to_str(path) }) else {
+        set_last_error("path is null or not utf8");
+        return -1;
+    };
+    match unsafe { &*engine }.engine.load_nnlm(path) {
+        Ok(n) => n.min(c_int::MAX as usize) as c_int,
+        Err(e) => {
+            set_last_error(format!("{e:#}"));
+            -1
+        }
+    }
+}
+
+/// 只检查文件是不是读得出来的字级神经语言模型，不载入引擎。返回字表大小，失败返回 -1。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_nnlm_check(path: *const c_char) -> c_int {
+    let Some(path) = (unsafe { cstr_to_str(path) }) else {
+        set_last_error("path is null or not utf8");
+        return -1;
+    };
+    match std::panic::catch_unwind(|| crate::nnlm::Nnlm::load(path)) {
+        Ok(Ok(model)) => model.vocab_size().min(c_int::MAX as usize) as c_int,
+        Ok(Err(e)) => {
+            set_last_error(format!("{e:#}"));
+            -1
+        }
+        Err(_) => {
+            set_last_error("模型文件格式不对");
+            -1
+        }
+    }
+}
+
+/// 混上领域词级模型（用户自己训的 words.domain.lm）。path 为 NULL/空串时去掉。
+/// 再调一次是换掉上一个。返回 0 成功，-1 失败（原来的模型不动）。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_set_domain_lm(
+    engine: *mut FlypeEngineHandle,
+    path: *const c_char,
+) -> c_int {
+    let Some(handle) = (unsafe { engine.as_mut() }) else {
+        set_last_error("engine handle is null");
+        return -1;
+    };
+    let model = match unsafe { cstr_to_str(path) } {
+        Some(path) if !path.is_empty() => match crate::lm::load_lm(path) {
+            Ok(model) => Some(model),
+            Err(e) => {
+                set_last_error(format!("{e:#}"));
+                return -1;
+            }
+        },
+        _ => None,
+    };
+    handle.engine.set_domain_lm(model);
+    0
+}
+
+/// 开关模糊音（z/zh、an/ang 等）。返回 0 成功，-1 失败。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_set_fuzzy(
+    engine: *mut FlypeEngineHandle,
+    on: c_int,
+) -> c_int {
+    if engine.is_null() {
+        set_last_error("engine is null");
+        return -1;
+    }
+    unsafe { &mut *engine }.engine.set_fuzzy(on != 0);
+    0
+}
+
+/// 设置打开的模糊音分组（位掩码：1 z/zh，2 c/ch，4 s/sh，8 n/l，16 f/h，32 r/l，
+/// 64 an/ang，128 en/eng，256 in/ing，512 ian/iang，1024 uan/uang，2048 un/ong）。总开关仍是 flype_engine_set_fuzzy。返回 0 成功，-1 失败。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_set_fuzzy_groups(
+    engine: *mut FlypeEngineHandle,
+    groups: u32,
+) -> c_int {
+    if engine.is_null() {
+        set_last_error("engine is null");
+        return -1;
+    }
+    unsafe { &mut *engine }.engine.set_fuzzy_groups(groups);
+    0
+}
+
+thread_local! {
+    /// 标点结果放这里，`flype_fullwidth_punct`/`flype_punct` 返回它的指针，下次调用就换掉
+    static PUNCT_BUF: RefCell<CString> =
+        RefCell::new(CString::new("，").expect("static punct"));
+}
+
+/// ASCII 标点转中文标点。返回的指针在下一次调用前有效，未收录返回 NULL。
+#[unsafe(no_mangle)]
+pub extern "C" fn flype_fullwidth_punct(code: c_int) -> *const c_char {
+    let Some(ch) = char::from_u32(code as u32) else {
+        return ptr::null();
+    };
+    let Some(text) = crate::symbols::fullwidth_punct(ch) else {
+        return ptr::null();
+    };
+    PUNCT_BUF.with(|slot| {
+        *slot.borrow_mut() = CString::new(text).unwrap_or_default();
+        slot.borrow().as_ptr()
+    })
+}
+
+/// 按标点样式转换。style：0 全角、1 半角；prev 是光标前一个字符（不知道传 0）。
+/// 返回 NULL 表示原样上屏这个 ASCII 字符。指针在下一次调用前有效。
+#[unsafe(no_mangle)]
+pub extern "C" fn flype_punct(code: c_int, style: c_int, prev: c_int) -> *const c_char {
+    let Some(ch) = char::from_u32(code as u32) else {
+        return ptr::null();
+    };
+    let style = if style == 1 {
+        crate::symbols::PunctStyle::Halfwidth
+    } else {
+        crate::symbols::PunctStyle::Fullwidth
+    };
+    let prev = if prev > 0 {
+        char::from_u32(prev as u32)
+    } else {
+        None
+    };
+    let Some(text) = crate::symbols::punct(ch, style, prev) else {
+        return ptr::null();
+    };
+    PUNCT_BUF.with(|slot| {
+        *slot.borrow_mut() = CString::new(text).unwrap_or_default();
+        slot.borrow().as_ptr()
+    })
+}
+
+/// 中英文之间自动补空格（ABI 1.2 起）：prev 是光标前一个字，next 是要上屏的第一个字，
+/// flags：1 汉字和字母之间、2 汉字和数字之间。要补空格返回 1，否则 0。
+#[unsafe(no_mangle)]
+pub extern "C" fn flype_autospace(prev: c_int, next: c_int, flags: c_int) -> c_int {
+    let (Some(prev), Some(next)) = (char::from_u32(prev as u32), char::from_u32(next as u32))
+    else {
+        return 0;
+    };
+    c_int::from(crate::autospace::needs_space(prev, next, flags as u32))
+}
+
+/// 全部内置符号（ABI 1.2 起），按内置顺序：工具栏的「符号」面板用。
+#[unsafe(no_mangle)]
+pub extern "C" fn flype_symbol_list() -> *mut FlypeCandidates {
+    let texts: Vec<CString> = crate::symbols::SYMBOLS
+        .iter()
+        .filter_map(|s| CString::new(s.text).ok())
+        .collect();
+    let scores = vec![0.0; texts.len()];
+    Box::into_raw(Box::new(FlypeCandidates::plain(texts, scores)))
+}
+
+/// 记下一条剪贴板文字（ABI 1.2 起；只在内存里，最多 20 条，最新的在前，重复的挪到最前）。
+/// 空白、超过 16 KB 的不记。记下返回 1，否则 0。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_clipboard_remember(text: *const c_char) -> c_int {
+    match unsafe { cstr_to_str(text) } {
+        Some(text) => c_int::from(crate::clipboard::remember(text)),
+        None => 0,
+    }
+}
+
+/// 剪贴板历史（ABI 1.2 起），最新的在前。
+#[unsafe(no_mangle)]
+pub extern "C" fn flype_clipboard_history() -> *mut FlypeCandidates {
+    let texts: Vec<CString> = crate::clipboard::history()
+        .into_iter()
+        .filter_map(|t| CString::new(t).ok())
+        .collect();
+    let scores = vec![0.0; texts.len()];
+    Box::into_raw(Box::new(FlypeCandidates::plain(texts, scores)))
+}
+
+/// 清空剪贴板历史（ABI 1.2 起）。
+#[unsafe(no_mangle)]
+pub extern "C" fn flype_clipboard_clear() {
+    crate::clipboard::clear();
+}
+
+/// 自定义词（常用语）按 custom.tsv 里的顺序（ABI 1.2 起）。text 是词（`\n` 等转义原样显示），
+/// pinyin 是编码，flype_candidates_commit 是上屏的文字（转义换成了真的换行）。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_custom_phrases(
+    engine: *const FlypeEngineHandle,
+) -> *mut FlypeCandidates {
+    if engine.is_null() {
+        set_last_error("engine is null");
+        return ptr::null_mut();
+    }
+    let mut out = FlypeCandidates::plain(Vec::new(), Vec::new());
+    for (code, word) in unsafe { &*engine }.engine.lexicon().custom_phrases() {
+        let (Ok(text), Ok(code), Ok(commit)) = (
+            CString::new(word.as_str()),
+            CString::new(code),
+            CString::new(crate::unescape_custom(&word)),
+        ) else {
+            continue;
+        };
+        out.texts.push(text);
+        out.scores.push(0.0);
+        out.pinyins.push(code);
+        out.consumed.push(0);
+        out.commits.push(commit);
+    }
+    Box::into_raw(Box::new(out))
+}
+
+/// 符号检索。query 为拼音或中文名前缀，结果放在候选结构里（score 恒为 0）。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_symbol_search(
+    query: *const c_char,
+    limit: usize,
+) -> *mut FlypeCandidates {
+    let Some(query) = (unsafe { cstr_to_str(query) }) else {
+        set_last_error("query is null or not utf8");
+        return ptr::null_mut();
+    };
+    let mut texts = Vec::new();
+    let mut scores = Vec::new();
+    for symbol in crate::symbols::search(query, limit) {
+        match CString::new(symbol.text) {
+            Ok(text) => {
+                texts.push(text);
+                scores.push(0.0);
+            }
+            Err(_) => continue,
+        }
+    }
+    Box::into_raw(Box::new(FlypeCandidates::plain(texts, scores)))
+}
+
+/// 候选正好是数字字（零到十）时对应的按键 emoji（「八」-> 8️⃣），别的返回 NULL。
+/// 返回的是静态字符串，不用释放。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_emoji_keycap(text: *const c_char) -> *const c_char {
+    match unsafe { cstr_to_str(text) }.and_then(crate::emoji::keycap_c) {
+        Some(emoji) => emoji.as_ptr(),
+        None => ptr::null(),
+    }
+}
+
+/// 打字时的 emoji 推荐：text 是首选候选的文字。结果的 text 是显示文字，
+/// 上屏文字用 flype_candidates_commit 取（整个词对上时只有 emoji，句尾对上时是整句 + emoji）。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_emoji_recommend(
+    text: *const c_char,
+    limit: usize,
+) -> *mut FlypeCandidates {
+    let Some(text) = (unsafe { cstr_to_str(text) }) else {
+        set_last_error("text is null or not utf8");
+        return ptr::null_mut();
+    };
+    let suggestions = crate::emoji::recommend(text, limit);
+    let mut texts = Vec::new();
+    let mut commits = Vec::new();
+    for suggestion in suggestions {
+        if let (Ok(display), Ok(commit)) = (
+            CString::new(suggestion.display),
+            CString::new(suggestion.commit),
+        ) {
+            texts.push(display);
+            commits.push(commit);
+        }
+    }
+    let scores = vec![0.0; texts.len()];
+    let mut out = FlypeCandidates::plain(texts, scores);
+    out.commits = commits;
+    Box::into_raw(Box::new(out))
+}
+
+/// 日期、时间候选：key 是触发词（riqi / shijian / xingqi / date / time，可带隔音符），
+/// 时间字段由调用方按本地时区给出（weekday 0 = 星期日）。不是触发词时返回空列表。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_datetime_candidates(
+    key: *const c_char,
+    year: c_int,
+    month: c_int,
+    day: c_int,
+    hour: c_int,
+    minute: c_int,
+    second: c_int,
+    weekday: c_int,
+) -> *mut FlypeCandidates {
+    let Some(key) = (unsafe { cstr_to_str(key) }) else {
+        set_last_error("key is null or not utf8");
+        return ptr::null_mut();
+    };
+    let now = crate::datetime::LocalTime {
+        year,
+        month: month.max(0) as u32,
+        day: day.max(0) as u32,
+        hour: hour.max(0) as u32,
+        minute: minute.max(0) as u32,
+        second: second.max(0) as u32,
+        weekday: weekday.max(0) as u32,
+    };
+    plain_candidates(crate::datetime::candidates(key, &now))
+}
+
+/// V 模式计算器：expr 是 v 后面的算式。算得出来时给「结果」「算式=结果」，
+/// 没写完时只给算式本身。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_calc_candidates(expr: *const c_char) -> *mut FlypeCandidates {
+    let Some(expr) = (unsafe { cstr_to_str(expr) }) else {
+        set_last_error("expr is null or not utf8");
+        return ptr::null_mut();
+    };
+    plain_candidates(crate::calc::candidates(expr))
+}
+
+/// 一串纯文本包成候选集合（分数全 0），日期、算式、符号共用这个出口
+fn plain_candidates(list: Vec<String>) -> *mut FlypeCandidates {
+    let texts: Vec<CString> = list
+        .into_iter()
+        .filter_map(|t| CString::new(t).ok())
+        .collect();
+    let scores = vec![0.0; texts.len()];
+    Box::into_raw(Box::new(FlypeCandidates::plain(texts, scores)))
+}
+
+/// 表情面板的搜索：query 为空给全部 emoji；否则按拼音（经引擎转成中文词）、英文和
+/// 符号名一起找。engine 可为 NULL（只按英文和符号名找）。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_emoji_search(
+    engine: *const FlypeEngineHandle,
+    query: *const c_char,
+    limit: usize,
+) -> *mut FlypeCandidates {
+    let Some(query) = (unsafe { cstr_to_str(query) }) else {
+        set_last_error("query is null or not utf8");
+        return ptr::null_mut();
+    };
+    let engine = unsafe { engine.as_ref() }.map(|handle| &handle.engine);
+    let results = crate::emoji::panel_search(engine, query, limit);
+    let texts: Vec<CString> = results
+        .into_iter()
+        .take(limit.max(1))
+        .filter_map(|t| CString::new(t).ok())
+        .collect();
+    let scores = vec![0.0; texts.len()];
+    Box::into_raw(Box::new(FlypeCandidates::plain(texts, scores)))
+}
+
+/// 选中后上屏的文字：emoji 推荐的结果可能和显示的不一样，其他候选就是 text。越界返回 NULL。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_candidates_commit(
+    candidates: *const FlypeCandidates,
+    index: usize,
+) -> *const c_char {
+    unsafe { candidates.as_ref() }
+        .and_then(|c| c.commits.get(index).or_else(|| c.texts.get(index)))
+        .map(|text| text.as_ptr())
+        .unwrap_or(ptr::null())
+}
+
+/// 记录选词并可携带拼音：选够次数后自动加入用户词库。pinyin 可为 NULL。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_engine_record_selection_ex(
+    engine: *mut FlypeEngineHandle,
+    word: *const c_char,
+    pinyin: *const c_char,
+) -> c_int {
+    if engine.is_null() {
+        set_last_error("engine is null");
+        return -1;
+    }
+    let Some(word) = (unsafe { cstr_to_str(word) }) else {
+        set_last_error("word is null or not utf8");
+        return -1;
+    };
+    let pinyin = unsafe { cstr_to_str(pinyin) }.filter(|p| !p.is_empty());
+    unsafe { &*engine }
+        .engine
+        .record_selection_with_pinyin(word, pinyin);
+    0
+}
+
+/// 候选数量。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_candidates_len(candidates: *const FlypeCandidates) -> usize {
+    unsafe { candidates.as_ref() }
+        .map(|c| c.texts.len())
+        .unwrap_or(0)
+}
+
+/// 候选文本（UTF-8，以 NUL 结尾）。索引越界返回 NULL。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_candidates_text(
+    candidates: *const FlypeCandidates,
+    index: usize,
+) -> *const c_char {
+    unsafe { candidates.as_ref() }
+        .and_then(|c| c.texts.get(index))
+        .map(|text| text.as_ptr())
+        .unwrap_or(ptr::null())
+}
+
+/// 候选分数。索引越界返回 0。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_candidates_score(
+    candidates: *const FlypeCandidates,
+    index: usize,
+) -> f64 {
+    unsafe { candidates.as_ref() }
+        .and_then(|c| c.scores.get(index).copied())
+        .unwrap_or(0.0)
+}
+
+/// 候选的拼音（空格分隔，按纠错后的音节）；没有拼音或越界返回空串/NULL。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_candidates_pinyin(
+    candidates: *const FlypeCandidates,
+    index: usize,
+) -> *const c_char {
+    unsafe { candidates.as_ref() }
+        .and_then(|c| c.pinyins.get(index))
+        .map(|text| text.as_ptr())
+        .unwrap_or(ptr::null())
+}
+
+/// 候选用掉了输入的多少字节。小于输入长度时是句首词候选：
+/// 上屏这个词后，剩下的输入（从这个偏移开始）继续留在编辑区。越界返回 0。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_candidates_consumed(
+    candidates: *const FlypeCandidates,
+    index: usize,
+) -> usize {
+    unsafe { candidates.as_ref() }
+        .and_then(|c| c.consumed.get(index).copied())
+        .unwrap_or(0)
+}
+
+/// 释放候选集合。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_candidates_free(candidates: *mut FlypeCandidates) {
+    if !candidates.is_null() {
+        drop(unsafe { Box::from_raw(candidates) });
+    }
+}
+
+thread_local! {
+    /// 分词结果放这里，`flype_segment_input` 用，在同一线程下一次调用前有效
+    static SEGMENTED: RefCell<CString> = RefCell::new(CString::default());
+}
+
+/// 按候选拼音（空格分隔）给输入分词：hengxiang + "heng xiang" -> heng'xiang。
+/// 切不了（英文、差得太多）返回 NULL；返回的串在同一线程下一次调用前有效。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_segment_input(
+    input: *const c_char,
+    pinyin: *const c_char,
+) -> *const c_char {
+    let (Some(input), Some(pinyin)) = (unsafe { cstr_to_str(input) }, unsafe {
+        cstr_to_str(pinyin)
+    }) else {
+        return ptr::null();
+    };
+    match crate::preedit::segment_input(input, pinyin).and_then(|s| CString::new(s).ok()) {
+        Some(text) => SEGMENTED.with(|slot| {
+            *slot.borrow_mut() = text;
+            slot.borrow().as_ptr()
+        }),
+        None => ptr::null(),
+    }
+}
+
+thread_local! {
+    /// 编码整理的结果放这里，`flype_custom_code` 和 `flype_guess_pinyin` 共用
+    static CUSTOM_CODE: RefCell<CString> = RefCell::new(CString::default());
+}
+
+/// 自定义词的编码整理（设置界面加词、导入用）。pinyin_only 非 0 时只认拼音（Ni Hǎo、nihao、
+/// ni3hao3 -> ni hao），否则不是拼音但全是字母的（mail）也行（小写）。不合法返回 NULL；
+/// 返回的串在同一线程下一次调用本函数或 flype_guess_pinyin 前有效。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_custom_code(
+    text: *const c_char,
+    pinyin_only: c_int,
+) -> *const c_char {
+    let Some(text) = (unsafe { cstr_to_str(text) }) else {
+        return ptr::null();
+    };
+    let code = if pinyin_only != 0 {
+        crate::lexicon::normalize_pinyin(text)
+    } else {
+        crate::lexicon::normalize_code(text)
+    };
+    match code.and_then(|s| CString::new(s).ok()) {
+        Some(code) => CUSTOM_CODE.with(|slot| {
+            *slot.borrow_mut() = code;
+            slot.borrow().as_ptr()
+        }),
+        None => ptr::null(),
+    }
+}
+
+/// 在词库原文（拼音<TAB>词<TAB>频次）里猜词的拼音，整理成空格分开的音节；猜不出返回 NULL。
+/// 返回的串在同一线程下一次调用本函数或 flype_custom_code 前有效。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn flype_guess_pinyin(
+    lexicon: *const c_char,
+    len: usize,
+    word: *const c_char,
+) -> *const c_char {
+    let Some(word) = (unsafe { cstr_to_str(word) }) else {
+        return ptr::null();
+    };
+    if lexicon.is_null() || len == 0 {
+        return ptr::null();
+    }
+    let lexicon = unsafe { std::slice::from_raw_parts(lexicon.cast::<u8>(), len) };
+    match crate::lexicon::guess_pinyin(lexicon, word).and_then(|s| CString::new(s).ok()) {
+        Some(code) => CUSTOM_CODE.with(|slot| {
+            *slot.borrow_mut() = code;
+            slot.borrow().as_ptr()
+        }),
+        None => ptr::null(),
+    }
+}
+
+/// 最近一次错误。返回的指针在下一次调用本 API 前有效。
+#[unsafe(no_mangle)]
+pub extern "C" fn flype_last_error() -> *const c_char {
+    LAST_ERROR.with(|slot| slot.borrow().as_ptr())
+}
+
+/// C 接口版本：主版本 * 1000 + 次版本。
+#[unsafe(no_mangle)]
+pub extern "C" fn flype_abi_version() -> c_int {
+    ABI_VERSION_MAJOR * 1000 + ABI_VERSION_MINOR
+}
+
+/// C 接口版本，和 `flype_core.h` 里的 `FLYPE_ABI_VERSION_*` 一致（测试会比对）。
+pub const ABI_VERSION_MAJOR: c_int = 3;
+/// C 接口次版本，加字段、加函数就加它
+pub const ABI_VERSION_MINOR: c_int = 0;
+
+/// Flype 版本号字符串。
+#[unsafe(no_mangle)]
+pub extern "C" fn flype_version() -> *const c_char {
+    concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 建引擎、打 xian 拿候选，再按句柄查文本/拼音/消费长度，最后释放
+    #[test]
+    fn ffi_roundtrip() {
+        let lexicon = concat!(env!("CARGO_MANIFEST_DIR"), "/data/demo_lexicon.tsv");
+        let lexicon = CString::new(lexicon).unwrap();
+        let engine = unsafe { flype_engine_new(lexicon.as_ptr(), ptr::null()) };
+        assert!(!engine.is_null(), "engine_new 失败: 见 last_error");
+
+        let input = CString::new("xian").unwrap();
+        let candidates = unsafe { flype_engine_input(engine, input.as_ptr()) };
+        assert!(!candidates.is_null());
+        let count = unsafe { flype_candidates_len(candidates) };
+        assert!(count >= 2, "xian 应至少有 先/西安 两个候选，实际 {count}");
+
+        let first = unsafe { flype_candidates_text(candidates, 0) };
+        assert!(!first.is_null());
+        let first = unsafe { CStr::from_ptr(first) }.to_str().unwrap();
+        assert!(!first.is_empty());
+
+        let len = unsafe { flype_candidates_consumed(candidates, 0) };
+        assert_eq!(len, 4, "整句候选用掉全部输入");
+        let pinyin = unsafe { flype_candidates_pinyin(candidates, 0) };
+        assert!(!pinyin.is_null());
+        assert!(unsafe { flype_candidates_pinyin(candidates, 99) }.is_null());
+
+        unsafe {
+            flype_candidates_free(candidates);
+            flype_engine_free(engine);
+        }
+
+        let version = flype_version();
+        assert!(!version.is_null());
+    }
+
+    /// 头文件里的 FLYPE_ABI_VERSION_* 跟这里的两常量、flype_abi_version 对得上
+    #[test]
+    fn abi_version_matches_header() {
+        let header = include_str!("../include/flype_core.h");
+        let read = |name: &str| -> c_int {
+            header
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("#define {name} ")))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(-1)
+        };
+        assert_eq!(read("FLYPE_ABI_VERSION_MAJOR"), ABI_VERSION_MAJOR);
+        assert_eq!(read("FLYPE_ABI_VERSION_MINOR"), ABI_VERSION_MINOR);
+        assert_eq!(flype_abi_version(), 3000);
+    }
+
+    /// 空路径、不存在的文件、别的格式（词库）都不当模型，一律 -1
+    #[test]
+    fn nnlm_check_rejects_bad_files() {
+        assert_eq!(unsafe { flype_nnlm_check(ptr::null()) }, -1);
+        let missing = CString::new("/nonexistent/nlrgpt2_nnlm.bin").unwrap();
+        assert_eq!(unsafe { flype_nnlm_check(missing.as_ptr()) }, -1);
+        // 别的文件（词库）不是模型
+        let lexicon = CString::new(concat!(env!("CARGO_MANIFEST_DIR"), "/data/demo_lexicon.tsv")).unwrap();
+        assert_eq!(unsafe { flype_nnlm_check(lexicon.as_ptr()) }, -1);
+    }
+}
+
+#[cfg(test)]
+mod toolbar_tests {
+    use super::*;
+
+    /// 把一个候选集合抄成 (text, pinyin, commit) 列表，顺手释放它
+    unsafe fn texts(c: *mut FlypeCandidates) -> Vec<(String, String, String)> {
+        assert!(!c.is_null());
+        let n = unsafe { flype_candidates_len(c) };
+        let get = |p: *const c_char| unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_string();
+        let out = (0..n)
+            .map(|i| unsafe {
+                (
+                    get(flype_candidates_text(c, i)),
+                    get(flype_candidates_pinyin(c, i)),
+                    get(flype_candidates_commit(c, i)),
+                )
+            })
+            .collect();
+        unsafe { flype_candidates_free(c) };
+        out
+    }
+
+    /// 自定义词按文件顺序出，转义换行只解到 commit，空码和坏行不收
+    #[test]
+    fn custom_phrases_in_file_order() {
+        let lexicon = concat!(env!("CARGO_MANIFEST_DIR"), "/data/demo_lexicon.tsv");
+        let lexicon = CString::new(lexicon).unwrap();
+        let engine = unsafe { flype_engine_new(lexicon.as_ptr(), ptr::null()) };
+        assert!(!engine.is_null());
+        unsafe { &*engine }.engine.lexicon().set_custom_tsv(
+            "# 注释\ndz\t北京市海淀区\\n100080\nni hao\t妮好\n\t空码\nbad1\t不收\n",
+        );
+        let got = unsafe { texts(flype_engine_custom_phrases(engine)) };
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "北京市海淀区\\n100080".to_string(),
+                    "dz".to_string(),
+                    "北京市海淀区\n100080".to_string()
+                ),
+                ("妮好".to_string(), "ni hao".to_string(), "妮好".to_string()),
+            ]
+        );
+        assert!(unsafe { flype_engine_custom_phrases(ptr::null()) }.is_null());
+        unsafe { flype_engine_free(engine) };
+    }
+
+    /// 剪贴板最新在前、NULL 不计、清空就没了；符号列表条目数和顺序跟内置的一致
+    #[test]
+    fn clipboard_and_symbols() {
+        let _guard = crate::clipboard::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        flype_clipboard_clear();
+        let a = CString::new("第一条").unwrap();
+        let b = CString::new("second").unwrap();
+        assert_eq!(unsafe { flype_clipboard_remember(a.as_ptr()) }, 1);
+        assert_eq!(unsafe { flype_clipboard_remember(b.as_ptr()) }, 1);
+        assert_eq!(unsafe { flype_clipboard_remember(ptr::null()) }, 0);
+        let got: Vec<String> = unsafe { texts(flype_clipboard_history()) }
+            .into_iter()
+            .map(|t| t.0)
+            .collect();
+        assert_eq!(got, vec!["second", "第一条"]);
+        flype_clipboard_clear();
+        assert!(unsafe { texts(flype_clipboard_history()) }.is_empty());
+
+        let symbols = unsafe { texts(flype_symbol_list()) };
+        assert_eq!(symbols.len(), crate::symbols::SYMBOLS.len());
+        assert_eq!(symbols[0].0, "，");
+    }
+}

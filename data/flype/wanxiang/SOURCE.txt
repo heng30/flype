@@ -1,0 +1,13 @@
+数据来源：万象拼音 rime_wanxiang（https://github.com/amzxyz/rime_wanxiang，作者 amzxyz），
+许可证 CC BY 4.0，见 LICENSE。
+版本：unknown（2026-11-19）
+
+Flype 做的改动（tools/rime2tsv.py、tools/add_hotwords.py，脚本 scripts/make-wanxiang.sh）：
+- 只取 wanxiang.dict.yaml 引用的这些词库：dicts/zi dicts/jichu dicts/lianxiang dicts/duoyin dicts/shici dicts/diming
+  没有收 dicts/cuoyin（错音错字，Flype 没有读音提示）。
+- 拼音去掉声调，ü 写成 v（ā bà -> a ba，lǜ -> lv），只留文字、拼音、词频三列。
+- 同一个词同一个读音出现多次时取最大词频。
+- 词频整体乘同一个系数，让总和为 7500000000（和默认的雾凇词库同一个量级），
+  排序不变。
+- 合进 Flype 的热词表 data/hotwords.tsv（AI、工作、网络用语）。
+没有用万象的 .gram 语法模型。

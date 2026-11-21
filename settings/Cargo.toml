@@ -1,0 +1,15 @@
+[package]
+name = "flype-config"
+readme.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+keywords.workspace = true
+repository.workspace = true
+description = "Flype settings: modify flype.conf"
+
+[dependencies]
+anyhow.workspace = true
+eframe.workspace = true
+flype-voice.workspace = true
+image.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "flype-voice"
+version.workspace = true
+edition.workspace = true
+description = "语音输入：热键状态机、音频帧、VAD、ASR 抽象、上屏"
+
+[dependencies]
+cpal.workspace = true
+anyhow.workspace = true
+
+[[bin]]
+name = "flype-asr"
+path = "src/bin/asr.rs"
+
+[[bin]]
+name = "flype-asr-eval"
+path = "src/bin/asr_eval.rs"

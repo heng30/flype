@@ -1,0 +1,210 @@
+//! 流式识别：说话中分块解码出中间结果（每块带前文/后文上下文重算，已定稿块不再变化）；
+//! 结束时整段一次解码出定稿，整段更准；太长时注意力开销平方增长，改用已定稿块 + 尾部
+use super::fbank::{Fbank, DIM};
+use super::model::Model;
+use std::sync::Arc;
+
+/// 中间结果的前文、块长、后文（特征帧，10ms/帧）
+const PREV: usize = 200;
+/// 块长（每次定稿固定推进的帧数）
+const BLK: usize = 400;
+/// 后文（块尾多算的帧，用来判断在哪截断）
+const POST: usize = 100;
+/// 每个解码窗口末尾补的静音帧：窗口在语音中途截断时，模型常整窗不出字，补静音后稳定
+const PAD: usize = 50;
+/// 整段解码的上限（特征帧）：20 秒内定稿等待约 0.5 秒，70 秒要近 4 秒
+const WHOLE_MAX: usize = 2000;
+
+/// 定稿算法。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinalMode {
+    /// 整段一次解码（20 秒以内），不补静音
+    Whole,
+    /// 整段一次解码，末尾补静音
+    WholePad,
+    /// 和中间结果一样分块解码（官方配置 use_bypass_as_final=false 的做法）
+    Blocks,
+}
+
+/// 流式解码器：攒够一块就定稿一块，已定稿的编号不再变动
+pub struct Stream {
+    /// 声学模型（同一个模型可以被多个流共享）
+    m: Arc<Model>,
+    /// 流式特征提取
+    fb: Fbank,
+    /// 已经算好、还没解码的特征帧
+    feats: Vec<[f32; DIM]>,
+    /// 已定稿的 token 编号
+    ids: Vec<u32>,
+    /// 已经解码到第几帧
+    s: usize,
+    /// 本次新解的起始帧
+    fresh: usize,
+}
+
+impl Stream {
+    /// 空特征、从第 0 帧开始
+    pub fn new(m: Arc<Model>) -> Self {
+        Stream {
+            m,
+            fb: Fbank::new(),
+            feats: Vec::new(),
+            ids: Vec::new(),
+            s: 0,
+            fresh: 0,
+        }
+    }
+
+    /// 追加 PCM 并抽特征帧，够一块加后文就定稿一块
+    pub fn push(&mut self, pcm: &[i16]) {
+        let n = self.feats.len();
+        self.fb.push(pcm, &mut self.feats);
+        self.fresh += self.feats.len() - n;
+        while self.feats.len() >= self.s + BLK + POST {
+            self.commit();
+        }
+    }
+
+    /// 距上次中间结果新增的特征帧数
+    pub fn fresh(&self) -> usize {
+        self.fresh
+    }
+
+    /// 解码 [s - prev, end) 并补 pad 帧静音，返回 s 之后的输出帧
+    fn decode(&self, prev: usize, end: usize, pad: usize) -> Vec<u32> {
+        let a = self.s.saturating_sub(prev);
+        let mut x = self.feats[a..end].to_vec();
+        x.resize(x.len() + pad, self.fb.silence());
+        let out = self.m.forward(&x);
+        out.get((self.s - a) / 5..).unwrap_or_default().to_vec()
+    }
+
+    /// 解码并定稿一块：只取块长内的输出，尽量落在块尾连续 blank 处
+    fn commit(&mut self) {
+        let mut ids = self.decode(PREV, self.s + BLK + POST, PAD);
+        ids.truncate(BLK / 5);
+        // 在块尾附近的连续 blank 处截断，避免字恰好落在块边界上被两边都丢掉
+        if let Some(c) = (ids.len() / 2..ids.len())
+            .rev()
+            .find(|&c| ids[c] == 0 && ids[c - 1] == 0)
+        {
+            ids.truncate(c);
+        }
+        self.s += ids.len() * 5;
+        self.ids.extend(ids);
+    }
+
+    /// 中间结果：已定稿部分 + 尾部临时解码（前文减半以省算力）；去掉末尾标点，避免边说边打时句号反复增删
+    pub fn partial(&mut self) -> String {
+        self.partial_with(PREV / 2)
+    }
+
+    /// 中间结果，尾部临时解码带 `prev` 帧前文（评测用）。
+    pub fn partial_with(&mut self, prev: usize) -> String {
+        self.fresh = 0;
+        let mut ids = self.ids.clone();
+        if self.feats.len() > self.s {
+            ids.extend(self.decode(prev, self.feats.len(), PAD));
+        }
+        tidy(&self.m.text(&ids)).trim_end_matches(PUNCT).to_string()
+    }
+
+    /// 定稿文本（默认整段一次解码）
+    pub fn finish(&mut self) -> String {
+        self.finish_with(FinalMode::Whole)
+    }
+
+    /// 定稿的几种算法（评测用，`flype-asr-eval` 比较它们）。
+    pub fn finish_with(&mut self, mode: FinalMode) -> String {
+        let whole = match mode {
+            FinalMode::Whole => Some(0),
+            FinalMode::WholePad => Some(PAD),
+            FinalMode::Blocks => None,
+        };
+        if let Some(pad) = whole.filter(|_| self.feats.len() <= WHOLE_MAX) {
+            let mut x = self.feats.clone();
+            x.resize(x.len() + pad, self.fb.silence());
+            let ids = self.m.forward(&x);
+            return tidy(&self.m.text(&ids));
+        }
+        if self.feats.len() > self.s {
+            let tail = self.decode(PREV, self.feats.len(), PAD);
+            self.ids.extend(tail);
+        }
+        tidy(&self.m.text(&self.ids))
+    }
+}
+
+/// 中间结果末尾要去掉的句读标点
+const PUNCT: &[char] = &['，', '。', '？', '！', '、', ',', '.', '?', '!'];
+
+/// 开口前的底噪偶尔被识别成一个逗号；偶尔出现「，。」这样的连续标点，只留后一个
+fn tidy(t: &str) -> String {
+    let c: Vec<char> = t.trim_start_matches(PUNCT).chars().collect();
+    c.iter()
+        .enumerate()
+        .filter(|&(i, ch)| !(PUNCT.contains(ch) && c.get(i + 1).is_some_and(|n| PUNCT.contains(n))))
+        .map(|(_, ch)| ch)
+        .collect()
+}
+
+/// 中间结果去抖：已经显示的字只有连着两次都被改掉才改。
+///
+/// 尾部那一段每次都是没有后文时临时解出来的，常常这次「在」下次「再」又改回「在」。
+/// 新结果只是在后面多了字就马上显示；要改已经显示的字，得两次解码都这么改才改。
+#[derive(Default, Debug, Clone)]
+pub struct Stabilizer {
+    /// 上一次的原始结果，用来判断有没有连续两次改成同一种
+    last: Vec<char>,
+    /// 现在显示给用户的文本
+    shown: Vec<char>,
+}
+
+/// 两段文本从头开始相同的字数
+fn common(a: &[char], b: &[char]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+impl Stabilizer {
+    /// 喂一个新结果，返回应当显示的文本；往后接的字立刻显示，改已显示的字要连续两次一致
+    pub fn update(&mut self, text: &str) -> String {
+        let cur: Vec<char> = text.chars().collect();
+        if cur.starts_with(&self.shown) {
+            self.shown = cur.clone();
+        } else {
+            // 两次解码都同意的那一段如果和显示的不一样，说明真要改
+            let agreed = common(&cur, &self.last);
+            let kept = common(&self.shown, &cur[..agreed]);
+            if kept < agreed.min(self.shown.len()) {
+                self.shown = cur.clone();
+            }
+        }
+        self.last = cur;
+        self.shown.iter().collect()
+    }
+
+    /// 清空状态，下一句从零开始
+    pub fn clear(&mut self) {
+        self.last.clear();
+        self.shown.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Stabilizer;
+
+    /// 验证往后追加的字立刻显示、只闪一次的改动被忽略、连续两次的改动才跟
+    #[test]
+    fn extensions_show_at_once_and_one_off_flips_are_ignored() {
+        let mut s = Stabilizer::default();
+        assert_eq!(s.update("我今天"), "我今天");
+        assert_eq!(s.update("我今天晚上"), "我今天晚上");
+        // 只闪一次的改动不显示
+        assert_eq!(s.update("我金天晚上"), "我今天晚上");
+        assert_eq!(s.update("我今天晚上想"), "我今天晚上想");
+        // 连着两次都改：跟着改
+        assert_eq!(s.update("我今天晚饭"), "我今天晚上想");
+        assert_eq!(s.update("我今天晚饭吃"), "我今天晚饭吃");
+    }
+}

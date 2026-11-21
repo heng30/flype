@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Flype 设置
+Name[en]=Flype Settings
+Comment=候选排列、模糊音、语音、自定义词
+Comment[en]=Candidates, fuzzy pinyin, voice, custom words
+Exec=flype-config
+Icon=flype
+Terminal=false
+Categories=Settings;Utility;
+Keywords=flype;input;ime;pinyin;

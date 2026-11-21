@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = ["core", "voice", "settings", "fcitx5-addon"]
+default-members = ["core", "voice", "settings"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "1.0.0"
+readme = "README.md"
+repository = "https://github.com/heng30/flype"
+keywords = ["fcitx5", "pinyin", "voice", "addon", "egui"]
+
+[profile.dev]
+lto = false
+debug = false
+opt-level = 0
+incremental = true
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = true
+strip = true
+debug = false
+panic = "abort"
+opt-level = "s"
+codegen-units = 1
+incremental = true
+
+[workspace.dependencies]
+cc = { version = "1.11", default-features = false }
+libc = { version = "0.2", default-features = false }
+cpal = { version = "0.18", default-features = false }
+anyhow = { version = "1.0", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
+eframe = { version = "0.37", default-features = false, features = [
+  "glow",
+  "wayland",
+  "clipboard",
+  "default_fonts",
+] }
+
+flype-core = { path = "core" }
+flype-voice = { path = "voice" }
